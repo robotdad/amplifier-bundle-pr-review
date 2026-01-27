@@ -163,6 +163,57 @@ steps:
     output: "workspace_path"
     timeout: 300
 
+  # ----------------------------------------------------------------------------
+  # Clone amplifier-core for cross-repo contract checking
+  # ----------------------------------------------------------------------------
+  - id: "clone-core-for-cross-repo"
+    type: "bash"
+    command: |
+      cd "{{workspace_dir}}"
+      
+      if [ -d "amplifier-core" ]; then
+        echo "Core already cloned, fetching latest..."
+        cd amplifier-core && git fetch origin main && git checkout main && git pull
+      else
+        echo "Cloning amplifier-core for cross-repo analysis..."
+        gh repo clone microsoft/amplifier-core
+      fi
+      
+      echo "Core cloned for cross-repo contract verification"
+    output: "core_clone_result"
+    timeout: 180
+
+  - id: "cross-repo-usage-check"
+    type: "agent"
+    agent: "foundation:explorer"
+    prompt: |
+      CRITICAL: Check for cross-repo contract violations.
+      
+      The PR modifies files in: {{workspace_dir}}/{{pr_info_raw.repo}}
+      Core is cloned at: {{workspace_dir}}/amplifier-core
+      
+      Your task:
+      1. Identify any function signatures, class methods, or Protocol implementations 
+         that changed in the PR (especially in resolvers.py, session_runner.py, or 
+         any file with "resolver" or "protocol" in the name)
+      
+      2. Search amplifier-core for usages of those changed interfaces:
+         - Look in amplifier_core/loader.py
+         - Look in amplifier_core/session.py
+         - Grep for the function/method names that changed
+      
+      3. Flag any potential contract violations where:
+         - Core calls a method with parameters the PR removed
+         - Core expects a return type the PR changed
+         - Core imports something the PR deleted
+      
+      This check exists because PR #65 removed 'profile_hint' from AppModuleResolver
+      but amplifier-core still called resolve() with profile_hint=, causing a crash.
+      
+      Report findings as: SAFE (no cross-repo issues) or WARNING (potential violations found)
+    output: "cross_repo_check"
+    timeout: 300
+
   # ============================================================================
   # PHASE 3: SHADOW ENVIRONMENT ANALYSIS
   # ============================================================================
