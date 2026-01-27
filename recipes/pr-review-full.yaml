@@ -1,6 +1,6 @@
 name: "pr-review-full"
 description: "Complete PR review workflow for amplifier-app-cli"
-version: "2.4.0"
+version: "2.5.0"
 author: "Amplifier PR Review Bundle"
 tags: ["pr-review", "amplifier", "testing"]
 
@@ -99,6 +99,9 @@ steps:
       
       echo "Checking out commit $COMMIT..." >&2
       git checkout "$COMMIT" >&2
+      
+      # Create a branch so git bundle includes this commit
+      git branch -f pr-under-review "$COMMIT" >&2 || true
       
       if [ ! -d ".git" ]; then
         echo "ERROR: Clone failed - no .git directory" >&2
@@ -268,91 +271,191 @@ steps:
 
   # ============================================================================
   # PHASE 4: SHADOW ENVIRONMENT TESTING
-  # Uses shadow-operator agent which has the shadow tool and verification knowledge
+  # Capture baseline state, run shadow tests, verify no host changes
   # ============================================================================
 
+  # Step 1: Capture verified baseline BEFORE shadow
+  - id: "pre-shadow-baseline"
+    type: "bash"
+    condition: "{{skip_shadow_tests}} != true"
+    command: |
+      set -e
+      
+      # Get host amplifier version
+      HOST_VERSION=$(amplifier --version 2>&1 || echo "NOT_INSTALLED")
+      
+      # Get verified commit from local PR clone
+      PR_PATH=$(echo "{{pr_repo_path}}" | tr -d '\n\r')
+      cd "$PR_PATH"
+      LOCAL_COMMIT=$(git rev-parse HEAD)
+      LOCAL_COMMIT_SHORT=$(git rev-parse --short HEAD)
+      
+      # Verify it matches expected
+      EXPECTED="{{pr_meta.headRefOid}}"
+      if [ "$LOCAL_COMMIT" != "$EXPECTED" ]; then
+        echo "ERROR: Local clone commit mismatch!" >&2
+        echo "  Expected: $EXPECTED" >&2
+        echo "  Actual:   $LOCAL_COMMIT" >&2
+        exit 1
+      fi
+      
+      # Output as JSON for downstream steps
+      cat << EOF
+      {
+        "host_amplifier_version": "$HOST_VERSION",
+        "local_pr_commit_full": "$LOCAL_COMMIT",
+        "local_pr_commit_short": "$LOCAL_COMMIT_SHORT",
+        "pr_repo_path": "$PR_PATH",
+        "verified": true
+      }
+      EOF
+    output: "baseline"
+    parse_json: true
+    timeout: 30
+
+  # Step 2: Run shadow tests with explicit labeling
   - id: "shadow-test"
     condition: "{{skip_shadow_tests}} != true"
     agent: "shadow-operator"
     prompt: |
-      Create a shadow environment and run smoke tests with the LOCAL PR code.
+      ## SHADOW ENVIRONMENT SMOKE TEST
       
-      ## Setup Information
+      You are testing PR code in an isolated container. Follow these steps EXACTLY.
       
-      Local PR repo path: {{pr_repo_path}}
-      GitHub repo: {{pr_info.full_repo}}
-      PR number: {{pr_info.pr_number}}
-      Expected commit: {{pr_meta.headRefOid}}
-      Skip LLM tests: {{skip_llm_smoke}}
+      ---
       
-      ## CRITICAL REQUIREMENTS
+      ## VERIFIED SOURCE INFORMATION (from recipe)
       
-      1. Create shadow with the LOCAL PR repo as a source:
-         - Local path: {{pr_repo_path}}
-         - Maps to: {{pr_info.full_repo}}
+      | Label | Value |
+      |-------|-------|
+      | **PR Number** | #{{pr_info.pr_number}} |
+      | **GitHub Repo** | {{pr_info.full_repo}} |
+      | **PR Title** | {{pr_meta.title}} |
+      | **VERIFIED PR COMMIT** | `{{baseline.local_pr_commit_full}}` |
+      | **Short Commit** | `{{baseline.local_pr_commit_short}}` |
+      | **Local Clone Path** | {{baseline.pr_repo_path}} |
+      | **Host Amplifier Version** | {{baseline.host_amplifier_version}} |
       
-      2. VERIFY the shadow was created correctly:
-         - Check snapshot_commits shows the expected commit
-         - Run a smoke clone test to verify URL rewriting works
+      The commit above has been VERIFIED to match the PR. Your job is to install THIS commit in the shadow and run smoke tests.
       
-      3. Install Amplifier from the LOCAL workspace (NOT from git URL):
-         ```
-         uv tool install /workspace/{{pr_info.full_repo}}
-         ```
-         This installs the PR code directly from the pre-cloned workspace.
+      ---
       
-      4. Verify the installed version shows the correct commit:
-         ```
-         amplifier --version
-         ```
-         Should show commit {{pr_meta.headRefOid}}
+      ## STEP-BY-STEP INSTRUCTIONS
       
-      5. Install providers:
-         ```
-         amplifier provider install -q
-         ```
+      ### 1. Create Shadow Environment
       
-      6. Install the smoke test bundle:
-         ```
-         amplifier bundle add git+https://github.com/samueljklee/amplifier-bundle-smoke-test --app
-         ```
+      Create shadow with the local PR repo:
+      - Local path: `{{baseline.pr_repo_path}}`
+      - Maps to: `{{pr_info.full_repo}}`
       
-      7. Run the smoke test recipe INSIDE the shadow:
-         ```
-         amplifier tool invoke recipes operation=execute recipe_path=@smoke-test:recipes/smoke-test.yaml context='{"skip_llm": {{skip_llm_smoke}}}'
-         ```
+      After creation, note the `snapshot_commits` value - it should show the verified commit.
       
-      8. Report results with:
-         - Shadow creation status (PASS/FAIL)
-         - Version verification (does --version show correct commit?)
-         - Smoke test results (full output)
-         - Any errors encountered
+      ### 2. Install Amplifier from Local Workspace
       
-      9. Destroy the shadow when done (or preserve if tests failed for debugging).
+      **CRITICAL**: Install from `/workspace/{{pr_info.full_repo}}` (the pre-cloned local source), NOT from a git URL:
       
-      ## Expected Output Format
+      ```bash
+      uv tool install /workspace/{{pr_info.full_repo}}
+      ```
+      
+      ### 3. Verify Installed Version
+      
+      ```bash
+      amplifier --version
+      ```
+      
+      **MUST show**: `{{baseline.local_pr_commit_short}}` in the version string.
+      
+      If it shows a DIFFERENT commit, STOP and report the mismatch. Do not proceed.
+      
+      ### 4. Install Providers
+      
+      ```bash
+      amplifier provider install -q
+      ```
+      
+      ### 5. Install Smoke Test Bundle
+      
+      ```bash
+      amplifier bundle add git+https://github.com/samueljklee/amplifier-bundle-smoke-test --app
+      ```
+      
+      ### 6. Run Smoke Tests
+      
+      ```bash
+      amplifier tool invoke recipes operation=execute recipe_path=@smoke-test:recipes/smoke-test.yaml context='{"skip_llm": {{skip_llm_smoke}}}'
+      ```
+      
+      ### 7. Final Version Check
+      
+      After smoke tests complete, verify version again:
+      ```bash
+      amplifier --version
+      ```
+      
+      If version changed during testing, flag this as a concern.
+      
+      ### 8. Cleanup
+      
+      Destroy the shadow (or preserve if tests failed).
+      
+      ---
+      
+      ## REQUIRED OUTPUT FORMAT
       
       ```
-      ## Shadow Test Results
+      ## Shadow Test Results for PR #{{pr_info.pr_number}}
       
-      **Shadow ID:** <id>
-      **PR Commit:** {{pr_meta.headRefOid}}
-      **Installed Version:** <output of amplifier --version>
+      ### Source Verification
+      | Check | Expected | Actual | Status |
+      |-------|----------|--------|--------|
+      | PR Commit | {{baseline.local_pr_commit_short}} | <actual> | PASS/FAIL |
+      | Snapshot Commit | {{baseline.local_pr_commit_short}} | <from shadow create> | PASS/FAIL |
+      | Installed Version | {{baseline.local_pr_commit_short}} | <from --version> | PASS/FAIL |
+      | Post-Test Version | {{baseline.local_pr_commit_short}} | <after smoke tests> | PASS/FAIL |
       
       ### Setup Status
       - Shadow created: PASS/FAIL
-      - Local source verified: PASS/FAIL  
       - Amplifier installed: PASS/FAIL
       - Providers installed: PASS/FAIL
       - Smoke bundle installed: PASS/FAIL
       
       ### Smoke Test Results
-      <full smoke test output>
+      <full output from smoke test recipe>
       
       ### Overall: PASS/FAIL
+      
+      **Shadow ID:** <id>
       ```
     output: "shadow_results"
     timeout: 1200
+
+  # Step 3: Verify host wasn't affected
+  - id: "post-shadow-verify"
+    type: "bash"
+    condition: "{{skip_shadow_tests}} != true"
+    command: |
+      set -e
+      
+      # Get current host amplifier version
+      CURRENT_VERSION=$(amplifier --version 2>&1 || echo "NOT_INSTALLED")
+      BASELINE_VERSION="{{baseline.host_amplifier_version}}"
+      
+      echo "=== Host Amplifier Version Check ===" >&2
+      echo "Before shadow: $BASELINE_VERSION" >&2
+      echo "After shadow:  $CURRENT_VERSION" >&2
+      
+      if [ "$CURRENT_VERSION" != "$BASELINE_VERSION" ]; then
+        echo "WARNING: Host amplifier version changed during shadow testing!" >&2
+        echo "This should not happen - shadow environments are isolated." >&2
+        echo "{\"host_unchanged\": false, \"before\": \"$BASELINE_VERSION\", \"after\": \"$CURRENT_VERSION\"}"
+      else
+        echo "Host amplifier unchanged (expected)." >&2
+        echo "{\"host_unchanged\": true, \"version\": \"$CURRENT_VERSION\"}"
+      fi
+    output: "host_verify"
+    parse_json: true
+    timeout: 30
 
   # ============================================================================
   # PHASE 5: FINAL REPORT
@@ -374,6 +477,7 @@ steps:
       - Security review: {{security_review}}
       - Python checks: {{python_results}}
       - Shadow environment smoke tests: {{shadow_results}}
+      - Host verification: {{host_verify}}
       
       Format as a GitHub PR comment with:
       1. Executive summary with overall verdict (APPROVE / REQUEST_CHANGES / COMMENT)
