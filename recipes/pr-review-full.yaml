@@ -79,38 +79,42 @@ steps:
       cd "{{paths.workspace}}"
       
       REPO="{{pr_info.full_repo}}"
-      BRANCH="{{pr_meta.headRefName}}"
+      COMMIT="{{pr_meta.headRefOid}}"
       REPO_DIR="{{pr_info.repo}}"
       
-      echo "Cloning $REPO branch $BRANCH into $REPO_DIR..."
+      echo "Cloning $REPO at commit $COMMIT..."
       
       if [ -d "$REPO_DIR" ]; then
-        echo "Repo exists, updating..."
+        echo "Repo exists, fetching..."
         cd "$REPO_DIR"
-        git fetch origin "$BRANCH"
-        git checkout "$BRANCH"
-        git pull origin "$BRANCH"
+        git fetch origin
       else
-        echo "Cloning fresh..."
-        gh repo clone "$REPO" "$REPO_DIR" -- --branch "$BRANCH"
+        echo "Cloning repo..."
+        gh repo clone "$REPO" "$REPO_DIR"
         cd "$REPO_DIR"
       fi
       
-      # Verify we're in the repo
+      # Checkout the specific commit (works for closed PRs where branch is deleted)
+      echo "Checking out commit $COMMIT..."
+      git checkout "$COMMIT"
+      
+      # Verify we're in the repo at the right commit
       if [ ! -d ".git" ]; then
         echo "ERROR: Clone failed - no .git directory" >&2
         exit 1
       fi
       
       ACTUAL=$(git rev-parse HEAD)
-      EXPECTED="{{pr_meta.headRefOid}}"
-      echo "Expected commit: $EXPECTED"
+      echo "Expected commit: $COMMIT"
       echo "Actual commit:   $ACTUAL"
       
+      if [ "$ACTUAL" != "$COMMIT" ]; then
+        echo "ERROR: Commit mismatch" >&2
+        exit 1
+      fi
+      
       # Output absolute path
-      REPO_PATH=$(pwd)
-      echo "PR repo path: $REPO_PATH"
-      echo "$REPO_PATH"
+      pwd
     output: "pr_repo_path"
     timeout: 300
 
