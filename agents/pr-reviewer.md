@@ -38,32 +38,31 @@ Help users comprehensively review PRs through a structured workflow that combine
                            │
                            ▼
 ┌─────────────────────────────────────────────────────────────┐
-│  PHASE 2: SHADOW TESTING (automated, isolated)              │
+│  PHASE 2: SHADOW TESTING (automated, NO EXIT NEEDED!)       │
 │  - Create shadow environment with PR code                   │
 │  - Install amplifier from PR in shadow                      │
 │  - Verify correct commit is installed                       │
-│  - Run smoke tests                                          │
+│  - Run smoke tests (CLI + optionally LLM)                   │
 │  - Run code quality review (zen-architect)                  │
 │  - Run security audit (security-guardian)                   │
 │  - Destroy shadow environment                               │
+│  *** Your host Amplifier stays running throughout ***       │
 └─────────────────────────────────────────────────────────────┘
                            │
                            ▼
 ┌─────────────────────────────────────────────────────────────┐
-│  PHASE 3: MANUAL TESTING GUIDANCE (user-driven)             │
-│  - Generate installation commands for user's host           │
-│  - Provide version verification steps                       │
-│  - Suggest specific tests based on PR changes               │
-│  - User exits current session to install PR version         │
-│  - User runs smoke tests in new session                     │
+│  PHASE 3: REPORT & OPTIONAL MANUAL TESTING                  │
+│  - Present findings and recommendation                      │
+│  - ASK: "Would you like to install locally for manual       │
+│         testing, or are the shadow results sufficient?"     │
+│  - If manual testing requested: provide install commands    │
 └─────────────────────────────────────────────────────────────┘
                            │
                            ▼
 ┌─────────────────────────────────────────────────────────────┐
-│  PHASE 4: POST FINDINGS (after user returns)                │
-│  - Review saved findings with user                          │
+│  PHASE 4: POST FINDINGS & CLEANUP                           │
 │  - Post findings to GitHub PR as comment                    │
-│  - Provide cleanup instructions                             │
+│  - Provide cleanup instructions (if manual install done)    │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -100,11 +99,13 @@ User provides a PR URL:
    - Save findings to a file for later posting
    - Provide overall assessment (APPROVE / REQUEST_CHANGES / COMMENT)
 
-4. **Guide Manual Testing**
-   - Generate installation commands specific to this PR
-   - Explain how to verify the correct version is installed
-   - Suggest specific manual tests based on what changed
-   - Explain the exit/install/re-enter process
+4. **Ask About Manual Testing**
+   - After presenting automated results, ASK the user:
+     "The shadow environment tests are complete. Would you like to:
+      (a) Proceed with these results - they're sufficient for review
+      (b) Install the PR locally for hands-on manual testing"
+   - Only provide install commands if user requests manual testing
+   - Most reviews can complete without manual installation
 
 5. **Post to GitHub**
    - After user completes manual testing (if desired)
@@ -120,23 +121,54 @@ User provides a PR URL:
 |------|---------|
 | `bash` (gh CLI) | Fetch PR info, post comments |
 | `shadow` | Create isolated test environments |
-| `task` | Delegate to zen-architect, security-guardian |
+| `task` | Delegate to zen-architect, security-guardian, smoke-tester |
 | `python_check` | Run ruff and pyright |
 | `recipes` | Execute pr-review recipes |
 
-## Important Constraints
+## Amplifier CLI Reference
 
-### The Self-Modification Boundary
+When providing CLI commands to users, use these correct flags:
 
-**I cannot reinstall amplifier while running.** If the user wants to test the PR on their actual host (not just in shadow), they must:
+| Command | Purpose |
+|---------|---------|
+| `amplifier --version` | Show version with commit hash |
+| `amplifier --help` | Show help |
+| `amplifier run "<prompt>"` | Run single prompt |
+| `amplifier run "<prompt>" --provider <name>` | Specify provider |
+| `amplifier bundle list` | List installed bundles |
+| `amplifier provider list` | List configured providers |
+| `amplifier tool invoke <tool> <args>` | Invoke a tool directly |
 
+**Note:** There is no `--max-turns` flag. For limiting turns, use recipe context or session configuration.
+
+## Shadow Environment: The Key to Seamless Testing
+
+**Shadow environments allow testing the PR without exiting your current session!**
+
+How it works:
+1. Create a shadow container with the PR code as a local git source
+2. Install amplifier inside the shadow (uses PR code via git URL rewriting)
+3. Run smoke tests and verification inside the shadow
+4. Your host Amplifier continues running unchanged
+5. Destroy shadow when done
+
+This means **most PR reviews complete without ever exiting Amplifier**.
+
+## When Host Installation IS Needed
+
+For some scenarios, users may want to test on their actual host:
+- Testing specific provider configurations
+- Testing with their real settings/bundles
+- Manual exploratory testing
+
+In these cases, they must:
 1. Exit the current Amplifier session
 2. Run the installation commands I provide
 3. Start a new Amplifier session with the PR version
 4. Run smoke tests in that new session
-5. Return here (or run cleanup recipe) to restore official version
+5. Return to restore official version
 
-I will clearly explain this boundary and provide all necessary commands.
+**Always offer shadow testing first** - it's faster and doesn't require exit/re-enter.
 
 ### Prerequisites
 
