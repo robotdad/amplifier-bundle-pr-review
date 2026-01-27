@@ -38,7 +38,7 @@ context:
   pr_url: ""                    # Required: Full GitHub PR URL
   workspace_dir: "./pr-review"  # Where to clone repos
   skip_shadow_tests: false      # Skip shadow environment tests
-  skip_llm_smoke: true          # Skip LLM smoke tests (faster)
+  skip_llm_smoke: false         # Run full smoke tests including LLM tests
 
 steps:
   # ============================================================================
@@ -197,6 +197,10 @@ steps:
         echo ""
         echo "=== Installing providers ==="
         amplifier provider install -q 2>/dev/null || echo "Provider install skipped"
+        
+        echo ""
+        echo "=== Installing smoke test bundle ==="
+        amplifier bundle add git+https://github.com/samueljklee/amplifier-bundle-smoke-test --app
     output: "shadow_install_result"
     timeout: 600
 
@@ -233,20 +237,15 @@ steps:
       operation: "exec"
       shadow_id: "{{shadow_info.shadow_id}}"
       command: |
-        echo "=== Running CLI smoke tests ==="
+        echo "=== Running Full Smoke Test Suite ==="
         
-        # Basic CLI tests
-        amplifier --help > /dev/null && echo "PASS: --help works" || echo "FAIL: --help"
-        amplifier --version > /dev/null && echo "PASS: --version works" || echo "FAIL: --version"
-        amplifier bundle list > /dev/null 2>&1 && echo "PASS: bundle list works" || echo "FAIL: bundle list"
-        amplifier provider list > /dev/null 2>&1 && echo "PASS: provider list works" || echo "FAIL: provider list"
-        amplifier module list > /dev/null 2>&1 && echo "PASS: module list works" || echo "FAIL: module list"
-        amplifier tool list > /dev/null 2>&1 && echo "PASS: tool list works" || echo "FAIL: tool list"
-        
-        echo ""
-        echo "=== CLI Smoke Test Complete ==="
+        # Run the actual smoke test recipe
+        amplifier tool invoke recipes \
+          operation=execute \
+          recipe_path=@smoke-test:recipes/smoke-test.yaml \
+          context='{"skip_llm": {{skip_llm_smoke}}}'
     output: "smoke_test_results"
-    timeout: 300
+    timeout: 600
 
   - id: "destroy-shadow"
     type: "tool"
