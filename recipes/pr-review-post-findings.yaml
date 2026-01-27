@@ -1,0 +1,119 @@
+name: "pr-review-post-findings"
+description: "Post saved review findings to a GitHub PR as a comment"
+version: "1.0.0"
+author: "Amplifier PR Review Bundle"
+tags: ["pr-review", "github", "posting"]
+
+# This recipe posts previously saved review findings to GitHub.
+#
+# Prerequisites:
+# - Review findings file exists (from pr-review-full recipe)
+# - GitHub CLI (gh) authenticated with repo write access
+#
+# Usage:
+#   "Run pr-review-post-findings with pr_url=https://github.com/microsoft/amplifier-app-cli/pull/65 findings_file=./pr-review/pr-65-review.md"
+
+context:
+  pr_url: ""           # Required: Full GitHub PR URL
+  findings_file: ""    # Required: Path to review findings markdown file
+  dry_run: false       # If true, show what would be posted without posting
+
+steps:
+  - id: "parse-pr-url"
+    type: "bash"
+    command: |
+      PR_URL="{{pr_url}}"
+      
+      if [[ ! "$PR_URL" =~ github\.com/([^/]+)/([^/]+)/pull/([0-9]+) ]]; then
+        echo "ERROR: Invalid PR URL format"
+        exit 1
+      fi
+      
+      OWNER="${BASH_REMATCH[1]}"
+      REPO="${BASH_REMATCH[2]}"
+      PR_NUMBER="${BASH_REMATCH[3]}"
+      
+      cat << EOF
+      {
+        "owner": "$OWNER",
+        "repo": "$REPO",
+        "pr_number": "$PR_NUMBER",
+        "full_repo": "$OWNER/$REPO"
+      }
+      EOF
+    output: "pr_info"
+    parse_json: true
+    timeout: 30
+
+  - id: "validate-findings-file"
+    type: "bash"
+    command: |
+      FINDINGS_FILE="{{findings_file}}"
+      
+      if [ ! -f "$FINDINGS_FILE" ]; then
+        echo "ERROR: Findings file not found: $FINDINGS_FILE"
+        echo "Run pr-review-full first to generate findings."
+        exit 1
+      fi
+      
+      # Get file stats
+      LINES=$(wc -l < "$FINDINGS_FILE")
+      SIZE=$(stat -c%s "$FINDINGS_FILE" 2>/dev/null || stat -f%z "$FINDINGS_FILE")
+      
+      echo "Findings file: $FINDINGS_FILE"
+      echo "Lines: $LINES"
+      echo "Size: $SIZE bytes"
+      
+      # GitHub has a 65536 character limit for comments
+      if [ "$SIZE" -gt 60000 ]; then
+        echo "WARNING: File is large, may need to be truncated"
+      fi
+    output: "file_validation"
+    timeout: 30
+
+  - id: "preview-comment"
+    type: "bash"
+    command: |
+      FINDINGS_FILE="{{findings_file}}"
+      
+      echo "=== COMMENT PREVIEW ==="
+      echo ""
+      echo "Would post to: {{pr_info.full_repo}}#{{pr_info.pr_number}}"
+      echo ""
+      echo "--- Content (first 50 lines) ---"
+      head -50 "$FINDINGS_FILE"
+      echo ""
+      echo "--- End Preview ---"
+    output: "preview"
+    timeout: 30
+
+  - id: "post-comment"
+    type: "bash"
+    condition: "{{dry_run}} != true"
+    command: |
+      FINDINGS_FILE="{{findings_file}}"
+      
+      echo "Posting review findings to PR #{{pr_info.pr_number}}..."
+      
+      gh pr comment {{pr_info.pr_number}} \
+        --repo {{pr_info.full_repo}} \
+        --body-file "$FINDINGS_FILE"
+      
+      if [ $? -eq 0 ]; then
+        echo ""
+        echo "SUCCESS: Review posted to {{pr_url}}"
+      else
+        echo "ERROR: Failed to post comment"
+        exit 1
+      fi
+    output: "post_result"
+    timeout: 120
+
+  - id: "dry-run-notice"
+    type: "bash"
+    condition: "{{dry_run}} == true"
+    command: |
+      echo "DRY RUN: Comment was NOT posted."
+      echo "Remove dry_run=true to actually post the comment."
+    output: "dry_run_result"
+    timeout: 10

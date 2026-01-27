@@ -1,0 +1,115 @@
+name: "pr-review-cleanup"
+description: "Restore official Amplifier CLI and clean up PR review workspace"
+version: "1.0.0"
+author: "Amplifier PR Review Bundle"
+tags: ["pr-review", "cleanup", "restore"]
+
+# This recipe restores the official Amplifier CLI after PR testing.
+#
+# Actions:
+# 1. Uninstall any PR version of amplifier-app-cli
+# 2. Reinstall official version from Microsoft repo
+# 3. Verify restoration
+# 4. Optionally clean up workspace directory
+#
+# Usage:
+#   "Run pr-review-cleanup"
+#   "Run pr-review-cleanup with cleanup_workspace=true workspace_dir=./pr-review"
+
+context:
+  cleanup_workspace: false      # If true, remove workspace directory
+  workspace_dir: "./pr-review"  # Workspace to clean up
+
+steps:
+  - id: "current-version"
+    type: "bash"
+    command: |
+      echo "=== Current Installation ==="
+      if command -v amplifier &> /dev/null; then
+        amplifier --version 2>/dev/null || echo "amplifier command exists but version check failed"
+      else
+        echo "amplifier not currently installed"
+      fi
+    output: "current_version"
+    timeout: 30
+
+  - id: "uninstall-pr-version"
+    type: "bash"
+    command: |
+      echo "=== Uninstalling PR Version ==="
+      
+      # Uninstall both to ensure clean slate
+      uv tool uninstall amplifier 2>/dev/null && echo "Uninstalled: amplifier" || echo "amplifier was not installed as uv tool"
+      uv tool uninstall amplifier-app-cli 2>/dev/null && echo "Uninstalled: amplifier-app-cli" || echo "amplifier-app-cli was not installed as uv tool"
+      
+      echo "Uninstall complete"
+    output: "uninstall_result"
+    timeout: 60
+
+  - id: "install-official"
+    type: "bash"
+    command: |
+      echo "=== Installing Official Amplifier CLI ==="
+      
+      uv tool install git+https://github.com/microsoft/amplifier-app-cli
+      
+      if [ $? -eq 0 ]; then
+        echo ""
+        echo "Installation successful"
+      else
+        echo "ERROR: Installation failed"
+        exit 1
+      fi
+    output: "install_result"
+    timeout: 300
+
+  - id: "verify-restoration"
+    type: "bash"
+    command: |
+      echo "=== Verifying Restoration ==="
+      
+      VERSION=$(amplifier --version 2>/dev/null)
+      
+      if [ $? -eq 0 ]; then
+        echo "Installed version: $VERSION"
+        echo ""
+        echo "SUCCESS: Official Amplifier CLI restored"
+      else
+        echo "ERROR: amplifier command not working after installation"
+        exit 1
+      fi
+    output: "verification"
+    timeout: 30
+
+  - id: "cleanup-workspace"
+    type: "bash"
+    condition: "{{cleanup_workspace}} == true"
+    command: |
+      WORKSPACE="{{workspace_dir}}"
+      
+      if [ -d "$WORKSPACE" ]; then
+        echo "Removing workspace: $WORKSPACE"
+        rm -rf "$WORKSPACE"
+        echo "Workspace cleaned up"
+      else
+        echo "Workspace not found: $WORKSPACE (already clean)"
+      fi
+    output: "workspace_cleanup"
+    timeout: 60
+
+  - id: "final-status"
+    type: "bash"
+    command: |
+      echo ""
+      echo "============================================"
+      echo "PR REVIEW CLEANUP COMPLETE"
+      echo "============================================"
+      echo ""
+      echo "Official Amplifier CLI has been restored."
+      echo ""
+      amplifier --version
+      echo ""
+      echo "You can now use Amplifier normally."
+      echo "============================================"
+    output: "final_status"
+    timeout: 30
