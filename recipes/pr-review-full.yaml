@@ -1,6 +1,6 @@
 name: "pr-review-full"
 description: "Complete PR review workflow for amplifier-app-cli"
-version: "2.2.0"
+version: "2.3.0"
 author: "Amplifier PR Review Bundle"
 tags: ["pr-review", "amplifier", "testing"]
 
@@ -82,7 +82,6 @@ steps:
       COMMIT="{{pr_meta.headRefOid}}"
       REPO_DIR="{{pr_info.repo}}"
       
-      # All status messages to stderr so only the final JSON goes to stdout
       echo "Cloning $REPO at commit $COMMIT..." >&2
       
       if [ -d "$REPO_DIR" ]; then
@@ -95,15 +94,12 @@ steps:
         cd "$REPO_DIR"
       fi
       
-      # Fetch the specific commit (needed for closed PRs - commit may not be in shallow clone)
       echo "Fetching commit $COMMIT..." >&2
       git fetch origin "$COMMIT" >&2 2>&1 || git fetch --unshallow origin >&2 2>&1 || true
       
-      # Checkout the specific commit
       echo "Checking out commit $COMMIT..." >&2
       git checkout "$COMMIT" >&2
       
-      # Verify we're in the repo at the right commit
       if [ ! -d ".git" ]; then
         echo "ERROR: Clone failed - no .git directory" >&2
         exit 1
@@ -117,7 +113,6 @@ steps:
         exit 1
       fi
       
-      # Only output the path (this goes to stdout and becomes the output variable)
       pwd
     output: "pr_repo_path"
     timeout: 300
@@ -129,14 +124,12 @@ steps:
       cd "{{paths.workspace}}"
       
       if [ -d "amplifier-core" ]; then
-        echo "Core exists, updating..."
         cd amplifier-core
-        git fetch origin main
-        git checkout main
-        git pull
+        git fetch origin main >&2
+        git checkout main >&2
+        git pull >&2
       else
-        echo "Cloning amplifier-core..."
-        gh repo clone microsoft/amplifier-core
+        gh repo clone microsoft/amplifier-core >&2
         cd amplifier-core
       fi
       
@@ -150,24 +143,129 @@ steps:
     timeout: 180
 
   # ============================================================================
-  # PHASE 3: CROSS-REPO CONTRACT CHECK
+  # PHASE 3: CODE ANALYSIS (runs BEFORE shadow tests so we get results even if shadow fails)
   # ============================================================================
 
   - id: "cross-repo-check"
     agent: "foundation:explorer"
     prompt: |
-      Check for cross-repo contract violations.
+      Check for cross-repo contract violations between the PR and amplifier-core.
       
       PR repo: {{pr_repo_path}}
       Core repo: {{core_path}}
+      Changed files in PR: {{changed_files}}
       
-      1. Find function/method signature changes in the PR
-      2. Search core for usages of those interfaces
-      3. Flag if core calls methods with removed parameters
+      Tasks:
+      1. Examine the changed files in the PR repo
+      2. Identify any function/method signature changes (especially in resolvers, protocols, public APIs)
+      3. Search core repo for usages of those interfaces
+      4. Flag if core calls methods with parameters the PR removes or changes
       
-      Report: SAFE or WARNING with details
+      Output a structured report with:
+      - VERDICT: SAFE or WARNING
+      - Summary of what you found
+      - Specific file:line references for any issues
     output: "cross_repo_result"
     timeout: 300
+
+  - id: "code-review"
+    agent: "foundation:zen-architect"
+    mode: "REVIEW"
+    prompt: |
+      Review this PR for code quality and architecture.
+      
+      PR: {{pr_info.full_repo}}#{{pr_info.pr_number}} - {{pr_meta.title}}
+      Author: {{pr_meta.author.login}}
+      Commit: {{pr_meta.headRefOid}}
+      Changed files: {{changed_files}}
+      Repo path: {{pr_repo_path}}
+      
+      Assess:
+      - Architecture and design patterns
+      - Code quality and readability
+      - Amplifier-specific patterns and philosophy alignment
+      - Potential issues or improvements
+      
+      Provide specific recommendations with file:line references.
+    output: "code_review"
+    timeout: 600
+
+  - id: "security-review"
+    agent: "foundation:security-guardian"
+    prompt: |
+      Security audit of PR changes.
+      
+      PR: {{pr_info.full_repo}}#{{pr_info.pr_number}} - {{pr_meta.title}}
+      Changed files: {{changed_files}}
+      Repo path: {{pr_repo_path}}
+      
+      Check for:
+      - OWASP Top 10 issues
+      - Command injection vulnerabilities
+      - Path traversal risks
+      - Hardcoded secrets or credentials
+      - Unsafe dependencies
+      
+      Provide PASS/FAIL verdict with specific findings.
+    output: "security_review"
+    timeout: 600
+
+  - id: "python-check"
+    type: "bash"
+    command: |
+      PR_PATH=$(echo "{{pr_repo_path}}" | tr -d '\n\r')
+      amplifier tool invoke python_check paths="[\"${PR_PATH}\"]" 2>&1 || echo "Check completed"
+    output: "python_results"
+    timeout: 300
+
+  # Save analysis results to disk BEFORE shadow tests
+  - id: "save-analysis"
+    type: "bash"
+    command: |
+      set -e
+      WORKSPACE=$(echo "{{paths.workspace}}" | tr -d '\n\r')
+      
+      cat > "${WORKSPACE}/pr-{{pr_info.pr_number}}-analysis.md" << 'ANALYSIS_EOF'
+      # PR Analysis Report: {{pr_info.full_repo}}#{{pr_info.pr_number}}
+      
+      **Title:** {{pr_meta.title}}
+      **Author:** {{pr_meta.author.login}}
+      **Commit:** {{pr_meta.headRefOid}}
+      **Changed Files:** {{pr_meta.changedFiles}}
+      
+      ---
+      
+      ## Cross-Repo Contract Check
+      
+      {{cross_repo_result}}
+      
+      ---
+      
+      ## Code Review
+      
+      {{code_review}}
+      
+      ---
+      
+      ## Security Review
+      
+      {{security_review}}
+      
+      ---
+      
+      ## Python Quality Check
+      
+      {{python_results}}
+      
+      ---
+      
+      *Analysis completed. Shadow environment testing pending.*
+      ANALYSIS_EOF
+      
+      echo "Analysis saved to: ${WORKSPACE}/pr-{{pr_info.pr_number}}-analysis.md" >&2
+      realpath "${WORKSPACE}/pr-{{pr_info.pr_number}}-analysis.md"
+    output: "analysis_report_path"
+    timeout: 30
 
   # ============================================================================
   # PHASE 4: SHADOW ENVIRONMENT TESTING
@@ -178,12 +276,10 @@ steps:
     condition: "{{skip_shadow_tests}} != true"
     command: |
       set -e
-      # Trim any whitespace/newlines from the path
       PR_PATH=$(echo "{{pr_repo_path}}" | tr -d '\n\r')
       
-      echo "Creating shadow with PR repo: $PR_PATH"
+      echo "Creating shadow with PR repo: $PR_PATH" >&2
       
-      # Verify the path exists
       if [ ! -d "$PR_PATH" ]; then
         echo "ERROR: PR repo path does not exist: $PR_PATH" >&2
         exit 1
@@ -202,20 +298,20 @@ steps:
     condition: "{{skip_shadow_tests}} != true"
     command: |
       set -e
-      echo "Installing Amplifier from local clone..."
+      echo "Installing Amplifier from local clone..." >&2
       
       amplifier tool invoke shadow \
         operation=exec \
         shadow_id="{{shadow.shadow_id}}" \
         command="uv tool install /workspace/{{pr_info.full_repo}} && amplifier --version"
       
-      echo "Installing providers..."
+      echo "Installing providers..." >&2
       amplifier tool invoke shadow \
         operation=exec \
         shadow_id="{{shadow.shadow_id}}" \
         command="amplifier provider install -q 2>/dev/null || true"
       
-      echo "Installing smoke test bundle..."
+      echo "Installing smoke test bundle..." >&2
       amplifier tool invoke shadow \
         operation=exec \
         shadow_id="{{shadow.shadow_id}}" \
@@ -228,7 +324,7 @@ steps:
     condition: "{{skip_shadow_tests}} != true"
     command: |
       set -e
-      echo "Running smoke tests..."
+      echo "Running smoke tests..." >&2
       
       amplifier tool invoke shadow \
         operation=exec \
@@ -249,67 +345,33 @@ steps:
     timeout: 60
 
   # ============================================================================
-  # PHASE 5: CODE REVIEW
-  # ============================================================================
-
-  - id: "code-review"
-    agent: "foundation:zen-architect"
-    mode: "REVIEW"
-    prompt: |
-      Review PR for code quality.
-      
-      PR: {{pr_info.full_repo}}#{{pr_info.pr_number}} - {{pr_meta.title}}
-      Changed files: {{changed_files}}
-      Repo path: {{pr_repo_path}}
-      
-      Assess architecture, code quality, Amplifier patterns.
-    output: "code_review"
-    timeout: 600
-
-  - id: "security-review"
-    agent: "foundation:security-guardian"
-    prompt: |
-      Security audit of PR changes.
-      
-      PR: {{pr_info.full_repo}}#{{pr_info.pr_number}}
-      Changed files: {{changed_files}}
-      Repo path: {{pr_repo_path}}
-      
-      Check OWASP issues, injection, path traversal, secrets.
-    output: "security_review"
-    timeout: 600
-
-  - id: "python-check"
-    type: "bash"
-    command: |
-      amplifier tool invoke python_check \
-        paths="[\"{{pr_repo_path}}\"]" 2>&1 || echo "Check completed"
-    output: "python_results"
-    timeout: 300
-
-  # ============================================================================
-  # PHASE 6: GENERATE REPORT
+  # PHASE 5: FINAL REPORT
   # ============================================================================
 
   - id: "synthesize"
     agent: "foundation:zen-architect"
     mode: "ARCHITECT"
     prompt: |
-      Create PR review report.
+      Create final PR review report combining all analysis and test results.
       
       PR: {{pr_info.full_repo}}#{{pr_info.pr_number}}: {{pr_meta.title}}
       Author: {{pr_meta.author.login}}
       Commit: {{pr_meta.headRefOid}}
       
       Results:
-      - Cross-repo: {{cross_repo_result}}
+      - Cross-repo contract check: {{cross_repo_result}}
+      - Code review: {{code_review}}
+      - Security review: {{security_review}}
+      - Python checks: {{python_results}}
       - Shadow install: {{install_result}}
       - Smoke tests: {{smoke_results}}
-      - Code review: {{code_review}}
-      - Security: {{security_review}}
-      - Python: {{python_results}}
       
-      Format as GitHub PR comment with executive summary, test results, issues, suggestions.
+      Format as a GitHub PR comment with:
+      1. Executive summary with overall verdict (APPROVE / REQUEST_CHANGES / COMMENT)
+      2. Test results summary (PASS/FAIL for each category)
+      3. Critical issues that must be addressed
+      4. Suggestions for improvement
+      5. Positive notes about the PR
     output: "report"
     timeout: 600
 
@@ -317,10 +379,12 @@ steps:
     type: "bash"
     command: |
       set -e
-      cat > "{{paths.workspace}}/pr-{{pr_info.pr_number}}-review.md" << 'EOF'
+      WORKSPACE=$(echo "{{paths.workspace}}" | tr -d '\n\r')
+      
+      cat > "${WORKSPACE}/pr-{{pr_info.pr_number}}-review.md" << 'EOF'
       {{report}}
       EOF
       
-      realpath "{{paths.workspace}}/pr-{{pr_info.pr_number}}-review.md"
+      realpath "${WORKSPACE}/pr-{{pr_info.pr_number}}-review.md"
     output: "final_output"
     timeout: 30
