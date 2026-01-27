@@ -28,6 +28,8 @@ tools:
     source: git+https://github.com/microsoft/amplifier-module-tool-filesystem@main
   - module: tool-search
     source: git+https://github.com/microsoft/amplifier-module-tool-search@main
+  - module: tool-shadow
+    source: git+https://github.com/microsoft/amplifier-bundle-shadow@main#subdirectory=modules/tool-shadow
 ---
 
 # Amplifier PR Review Bundle
