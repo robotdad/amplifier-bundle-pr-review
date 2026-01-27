@@ -433,64 +433,45 @@ steps:
     type: "bash"
     command: |
       WORKSPACE="{{workspace_dir}}"
-      GUIDE_FILE="$WORKSPACE/pr-{{pr_info_raw.pr_number}}-install-guide.md"
+      GUIDE_FILE="$WORKSPACE/pr-{{pr_info_raw.pr_number}}-optional-manual-install.md"
       
       cat > "$GUIDE_FILE" << 'GUIDE_EOF'
-      # Manual Installation Guide for PR #{{pr_info_raw.pr_number}}
+      # Optional: Manual Installation for PR #{{pr_info_raw.pr_number}}
+      
+      **Note:** Shadow environment testing already verified the PR works.
+      Manual installation is only needed if you want hands-on testing with
+      your personal environment (your providers, bundles, settings).
+      
+      Most reviews do NOT require this step.
       
       ## PR Information
       - **Repository:** {{pr_info_raw.full_repo}}
       - **Branch:** {{pr_metadata_raw.headRefName}}
       - **Commit:** {{pr_metadata_raw.headRefOid}}
       
-      ## Installation Steps
+      ---
       
-      ### 1. Clean Installation (Recommended)
+      ## If You Want Manual Testing
+      
+      ### 1. Exit Amplifier and Install PR Version
       
       ```bash
-      # Remove existing installations
-      uv tool uninstall amplifier 2>/dev/null || true
-      uv tool uninstall amplifier-app-cli 2>/dev/null || true
-      
-      # Install from PR branch
-      uv tool install git+https://github.com/{{pr_info_raw.full_repo}}@{{pr_metadata_raw.headRefName}}
+      # Exit your current Amplifier session first, then:
+      uv tool install --force git+https://github.com/{{pr_info_raw.full_repo}}@{{pr_metadata_raw.headRefName}}
       ```
       
       ### 2. Verify Installation
       
       ```bash
       amplifier --version
-      # Should show commit: {{pr_metadata_raw.headRefOid}}
+      # Should contain: {{pr_metadata_raw.headRefOid}}
       ```
       
-      Expected output should contain: `{{pr_metadata_raw.headRefOid}}`
+      ### 3. Test Specific PR Functionality
       
-      ### 3. Run Smoke Tests
-      
-      ```bash
-      # Start new Amplifier session
-      amplifier
-      
-      # In session, run:
-      > Run smoke tests
-      ```
-      
-      Or via CLI:
-      ```bash
-      amplifier tool invoke recipes \
-        operation=execute \
-        recipe_path=@smoke-test:recipes/smoke-test.yaml \
-        context='{"skip_llm": true}'
-      ```
-      
-      ### 4. Manual Testing
-      
-      Test the specific functionality changed in this PR:
       - {{pr_metadata_raw.title}}
       
-      ## Cleanup
-      
-      After testing, restore official release:
+      ### 4. Restore Official Version (when done)
       
       ```bash
       uv tool install --force git+https://github.com/microsoft/amplifier-app-cli
@@ -498,7 +479,7 @@ steps:
       ```
       GUIDE_EOF
       
-      echo "Install guide saved to: $GUIDE_FILE"
+      echo "Optional install guide saved to: $GUIDE_FILE"
       echo "$GUIDE_FILE"
     output: "install_guide_path"
     timeout: 30
@@ -512,16 +493,16 @@ steps:
       
       **Files Generated:**
       - Review findings: {{findings_file_path}}
-      - Install guide: {{install_guide_path}}
+      - Optional manual install guide: {{install_guide_path}}
       
-      **Key Results:**
-      - Shadow environment tests: {{smoke_test_results}}
+      **Shadow Environment Results (your local Amplifier was NOT modified):**
+      - Smoke tests: {{smoke_test_results}}
       - Commit verification: {{commit_verification}}
       
       Provide:
       1. One-sentence overall assessment
-      2. Next steps for the reviewer (install manually? post findings? approve?)
-      3. Reminder about cleanup after testing
+      2. Next steps: post findings to PR? approve/request changes?
+      3. Note that shadow testing is complete - manual installation is optional and usually not needed
       
       Keep it concise - this is the wrap-up message.
     output: "final_summary"
