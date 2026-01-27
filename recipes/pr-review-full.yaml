@@ -94,7 +94,11 @@ steps:
         cd "$REPO_DIR"
       fi
       
-      # Checkout the specific commit (works for closed PRs where branch is deleted)
+      # Fetch the specific commit (needed for closed PRs - commit may not be in shallow clone)
+      echo "Fetching commit $COMMIT..."
+      git fetch origin "$COMMIT" || git fetch --unshallow origin || true
+      
+      # Checkout the specific commit
       echo "Checking out commit $COMMIT..."
       git checkout "$COMMIT"
       
