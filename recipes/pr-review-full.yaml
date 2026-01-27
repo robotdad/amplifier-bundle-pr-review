@@ -82,25 +82,26 @@ steps:
       COMMIT="{{pr_meta.headRefOid}}"
       REPO_DIR="{{pr_info.repo}}"
       
-      echo "Cloning $REPO at commit $COMMIT..."
+      # All status messages to stderr so only the final JSON goes to stdout
+      echo "Cloning $REPO at commit $COMMIT..." >&2
       
       if [ -d "$REPO_DIR" ]; then
-        echo "Repo exists, fetching..."
+        echo "Repo exists, fetching..." >&2
         cd "$REPO_DIR"
-        git fetch origin
+        git fetch origin >&2
       else
-        echo "Cloning repo..."
-        gh repo clone "$REPO" "$REPO_DIR"
+        echo "Cloning repo..." >&2
+        gh repo clone "$REPO" "$REPO_DIR" >&2
         cd "$REPO_DIR"
       fi
       
       # Fetch the specific commit (needed for closed PRs - commit may not be in shallow clone)
-      echo "Fetching commit $COMMIT..."
-      git fetch origin "$COMMIT" || git fetch --unshallow origin || true
+      echo "Fetching commit $COMMIT..." >&2
+      git fetch origin "$COMMIT" >&2 2>&1 || git fetch --unshallow origin >&2 2>&1 || true
       
       # Checkout the specific commit
-      echo "Checking out commit $COMMIT..."
-      git checkout "$COMMIT"
+      echo "Checking out commit $COMMIT..." >&2
+      git checkout "$COMMIT" >&2
       
       # Verify we're in the repo at the right commit
       if [ ! -d ".git" ]; then
@@ -109,15 +110,14 @@ steps:
       fi
       
       ACTUAL=$(git rev-parse HEAD)
-      echo "Expected commit: $COMMIT"
-      echo "Actual commit:   $ACTUAL"
+      echo "Expected: $COMMIT, Actual: $ACTUAL" >&2
       
       if [ "$ACTUAL" != "$COMMIT" ]; then
         echo "ERROR: Commit mismatch" >&2
         exit 1
       fi
       
-      # Output absolute path
+      # Only output the path (this goes to stdout and becomes the output variable)
       pwd
     output: "pr_repo_path"
     timeout: 300
