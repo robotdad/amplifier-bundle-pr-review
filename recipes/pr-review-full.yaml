@@ -1,6 +1,6 @@
 name: "pr-review-full"
 description: "Complete PR review workflow for amplifier-app-cli"
-version: "2.3.0"
+version: "2.4.0"
 author: "Amplifier PR Review Bundle"
 tags: ["pr-review", "amplifier", "testing"]
 
@@ -143,7 +143,7 @@ steps:
     timeout: 180
 
   # ============================================================================
-  # PHASE 3: CODE ANALYSIS (runs BEFORE shadow tests so we get results even if shadow fails)
+  # PHASE 3: CODE ANALYSIS (runs BEFORE shadow tests)
   # ============================================================================
 
   - id: "cross-repo-check"
@@ -218,7 +218,6 @@ steps:
     output: "python_results"
     timeout: 300
 
-  # Save analysis results to disk BEFORE shadow tests
   - id: "save-analysis"
     type: "bash"
     command: |
@@ -269,80 +268,91 @@ steps:
 
   # ============================================================================
   # PHASE 4: SHADOW ENVIRONMENT TESTING
+  # Uses shadow-operator agent which has the shadow tool and verification knowledge
   # ============================================================================
 
-  - id: "create-shadow"
-    type: "bash"
+  - id: "shadow-test"
     condition: "{{skip_shadow_tests}} != true"
-    command: |
-      set -e
-      PR_PATH=$(echo "{{pr_repo_path}}" | tr -d '\n\r')
+    agent: "shadow-operator"
+    prompt: |
+      Create a shadow environment and run smoke tests with the LOCAL PR code.
       
-      echo "Creating shadow with PR repo: $PR_PATH" >&2
+      ## Setup Information
       
-      if [ ! -d "$PR_PATH" ]; then
-        echo "ERROR: PR repo path does not exist: $PR_PATH" >&2
-        exit 1
-      fi
+      Local PR repo path: {{pr_repo_path}}
+      GitHub repo: {{pr_info.full_repo}}
+      PR number: {{pr_info.pr_number}}
+      Expected commit: {{pr_meta.headRefOid}}
+      Skip LLM tests: {{skip_llm_smoke}}
       
-      amplifier tool invoke shadow \
-        operation=create \
-        name="pr-review-{{pr_info.pr_number}}" \
-        local_sources="[\"${PR_PATH}:{{pr_info.full_repo}}\"]"
-    output: "shadow"
-    parse_json: true
-    timeout: 300
-
-  - id: "shadow-install"
-    type: "bash"
-    condition: "{{skip_shadow_tests}} != true"
-    command: |
-      set -e
-      echo "Installing Amplifier from local clone..." >&2
+      ## CRITICAL REQUIREMENTS
       
-      amplifier tool invoke shadow \
-        operation=exec \
-        shadow_id="{{shadow.shadow_id}}" \
-        command="uv tool install /workspace/{{pr_info.full_repo}} && amplifier --version"
+      1. Create shadow with the LOCAL PR repo as a source:
+         - Local path: {{pr_repo_path}}
+         - Maps to: {{pr_info.full_repo}}
       
-      echo "Installing providers..." >&2
-      amplifier tool invoke shadow \
-        operation=exec \
-        shadow_id="{{shadow.shadow_id}}" \
-        command="amplifier provider install -q 2>/dev/null || true"
+      2. VERIFY the shadow was created correctly:
+         - Check snapshot_commits shows the expected commit
+         - Run a smoke clone test to verify URL rewriting works
       
-      echo "Installing smoke test bundle..." >&2
-      amplifier tool invoke shadow \
-        operation=exec \
-        shadow_id="{{shadow.shadow_id}}" \
-        command="amplifier bundle add git+https://github.com/samueljklee/amplifier-bundle-smoke-test --app"
-    output: "install_result"
-    timeout: 600
-
-  - id: "shadow-smoke-test"
-    type: "bash"
-    condition: "{{skip_shadow_tests}} != true"
-    command: |
-      set -e
-      echo "Running smoke tests..." >&2
+      3. Install Amplifier from the LOCAL workspace (NOT from git URL):
+         ```
+         uv tool install /workspace/{{pr_info.full_repo}}
+         ```
+         This installs the PR code directly from the pre-cloned workspace.
       
-      amplifier tool invoke shadow \
-        operation=exec \
-        shadow_id="{{shadow.shadow_id}}" \
-        command="amplifier tool invoke recipes operation=execute recipe_path=@smoke-test:recipes/smoke-test.yaml context='{\"skip_llm\": {{skip_llm_smoke}}}'"
-    output: "smoke_results"
-    timeout: 900
-
-  - id: "destroy-shadow"
-    type: "bash"
-    condition: "{{skip_shadow_tests}} != true"
-    command: |
-      amplifier tool invoke shadow \
-        operation=destroy \
-        shadow_id="{{shadow.shadow_id}}" || true
-    output: "cleanup"
-    on_error: "continue"
-    timeout: 60
+      4. Verify the installed version shows the correct commit:
+         ```
+         amplifier --version
+         ```
+         Should show commit {{pr_meta.headRefOid}}
+      
+      5. Install providers:
+         ```
+         amplifier provider install -q
+         ```
+      
+      6. Install the smoke test bundle:
+         ```
+         amplifier bundle add git+https://github.com/samueljklee/amplifier-bundle-smoke-test --app
+         ```
+      
+      7. Run the smoke test recipe INSIDE the shadow:
+         ```
+         amplifier tool invoke recipes operation=execute recipe_path=@smoke-test:recipes/smoke-test.yaml context='{"skip_llm": {{skip_llm_smoke}}}'
+         ```
+      
+      8. Report results with:
+         - Shadow creation status (PASS/FAIL)
+         - Version verification (does --version show correct commit?)
+         - Smoke test results (full output)
+         - Any errors encountered
+      
+      9. Destroy the shadow when done (or preserve if tests failed for debugging).
+      
+      ## Expected Output Format
+      
+      ```
+      ## Shadow Test Results
+      
+      **Shadow ID:** <id>
+      **PR Commit:** {{pr_meta.headRefOid}}
+      **Installed Version:** <output of amplifier --version>
+      
+      ### Setup Status
+      - Shadow created: PASS/FAIL
+      - Local source verified: PASS/FAIL  
+      - Amplifier installed: PASS/FAIL
+      - Providers installed: PASS/FAIL
+      - Smoke bundle installed: PASS/FAIL
+      
+      ### Smoke Test Results
+      <full smoke test output>
+      
+      ### Overall: PASS/FAIL
+      ```
+    output: "shadow_results"
+    timeout: 1200
 
   # ============================================================================
   # PHASE 5: FINAL REPORT
@@ -363,8 +373,7 @@ steps:
       - Code review: {{code_review}}
       - Security review: {{security_review}}
       - Python checks: {{python_results}}
-      - Shadow install: {{install_result}}
-      - Smoke tests: {{smoke_results}}
+      - Shadow environment smoke tests: {{shadow_results}}
       
       Format as a GitHub PR comment with:
       1. Executive summary with overall verdict (APPROVE / REQUEST_CHANGES / COMMENT)
