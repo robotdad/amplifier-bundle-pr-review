@@ -178,18 +178,21 @@ steps:
     condition: "{{skip_shadow_tests}} != true"
     command: |
       set -e
-      echo "Creating shadow with PR repo: {{pr_repo_path}}"
+      # Trim any whitespace/newlines from the path
+      PR_PATH=$(echo "{{pr_repo_path}}" | tr -d '\n\r')
+      
+      echo "Creating shadow with PR repo: $PR_PATH"
       
       # Verify the path exists
-      if [ ! -d "{{pr_repo_path}}" ]; then
-        echo "ERROR: PR repo path does not exist: {{pr_repo_path}}" >&2
+      if [ ! -d "$PR_PATH" ]; then
+        echo "ERROR: PR repo path does not exist: $PR_PATH" >&2
         exit 1
       fi
       
       amplifier tool invoke shadow \
         operation=create \
         name="pr-review-{{pr_info.pr_number}}" \
-        local_sources="[\"{{pr_repo_path}}:{{pr_info.full_repo}}\"]"
+        local_sources="[\"${PR_PATH}:{{pr_info.full_repo}}\"]"
     output: "shadow"
     parse_json: true
     timeout: 300
