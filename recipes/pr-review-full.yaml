@@ -1,54 +1,43 @@
 name: "pr-review-full"
 description: "Complete PR review workflow for amplifier-app-cli: fetch, analyze, test, and prepare findings"
-version: "2.0.0"
+version: "2.1.0"
 author: "Amplifier PR Review Bundle"
 tags: ["pr-review", "amplifier", "code-review", "security", "testing"]
 
-# This recipe performs a comprehensive PR review workflow:
-#
-# Phase 1: Fetch PR Information
-#   - Parse PR URL to extract owner, repo, PR number
-#   - Fetch PR metadata (title, description, branch, commits)
-#   - Identify changed files
-#
-# Phase 2: Clone and Setup
-#   - Clone PR branch to workspace
-#   - Clone amplifier-core for cross-repo contract checking
-#
-# Phase 3: Shadow Environment Analysis (automated, no host changes)
-#   - Create shadow with PR code as local source
-#   - Install Amplifier FROM LOCAL CLONE (not GitHub - avoids UV cache issues)
-#   - Install smoke test bundle
-#   - Run full smoke tests
-#   - Verify PR commit matches installed version
-#
-# Phase 4: Code Review
-#   - Run code quality review (zen-architect)
-#   - Run security audit (security-guardian)
-#   - Run Python checks (ruff, pyright)
-#   - Cross-repo contract checking
-#
-# Phase 5: Generate Outputs
-#   - Save review findings to file
-#   - Generate optional manual installation guide
-#
 # Usage:
 #   amplifier tool invoke recipes operation=execute \
 #     recipe_path=@pr-review:recipes/pr-review-full.yaml \
 #     context='{"pr_url": "https://github.com/microsoft/amplifier-app-cli/pull/65"}'
 #
 # Required: GitHub CLI (gh) authenticated, Docker/Podman for shadow environments
-# Typical runtime: 15-30 minutes
 
 context:
   pr_url: ""                    # Required: Full GitHub PR URL
-  workspace_dir: "./pr-review"  # Where to clone repos
+  workspace_base: "./pr-review" # Where to clone repos (will be converted to absolute path)
   skip_shadow_tests: false      # Skip shadow environment tests
-  skip_llm_smoke: false         # Run full smoke tests including LLM tests
+  skip_llm_smoke: false         # Skip LLM smoke tests
 
 steps:
   # ============================================================================
-  # PHASE 1: FETCH PR INFORMATION
+  # PHASE 1: SETUP WORKSPACE (must run first to get absolute paths)
+  # ============================================================================
+  
+  - id: "init-workspace"
+    type: "bash"
+    command: |
+      # Create workspace and get absolute path
+      mkdir -p "{{workspace_base}}"
+      cd "{{workspace_base}}"
+      WORKSPACE_ABS=$(pwd)
+      
+      # Output as JSON
+      echo "{\"workspace\": \"${WORKSPACE_ABS}\"}"
+    output: "paths"
+    parse_json: true
+    timeout: 30
+
+  # ============================================================================
+  # PHASE 2: FETCH PR INFORMATION
   # ============================================================================
   
   - id: "parse-pr-url"
@@ -56,7 +45,6 @@ steps:
     command: |
       PR_URL="{{pr_url}}"
       
-      # Validate URL format
       if [[ ! "$PR_URL" =~ github\.com/([^/]+)/([^/]+)/pull/([0-9]+) ]]; then
         echo "ERROR: Invalid PR URL format. Expected: https://github.com/owner/repo/pull/number"
         exit 1
@@ -66,83 +54,46 @@ steps:
       REPO="${BASH_REMATCH[2]}"
       PR_NUMBER="${BASH_REMATCH[3]}"
       
-      # Output as JSON for parsing
-      cat << EOF
-      {
-        "owner": "$OWNER",
-        "repo": "$REPO",
-        "pr_number": "$PR_NUMBER",
-        "full_repo": "$OWNER/$REPO"
-      }
-      EOF
-    output: "pr_info_raw"
+      echo "{\"owner\": \"$OWNER\", \"repo\": \"$REPO\", \"pr_number\": \"$PR_NUMBER\", \"full_repo\": \"$OWNER/$REPO\"}"
+    output: "pr_info"
     parse_json: true
     timeout: 30
 
   - id: "fetch-pr-metadata"
     type: "bash"
     command: |
-      gh pr view {{pr_info_raw.pr_number}} \
-        --repo {{pr_info_raw.full_repo}} \
+      gh pr view {{pr_info.pr_number}} \
+        --repo {{pr_info.full_repo}} \
         --json title,body,headRefName,headRefOid,baseRefName,author,additions,deletions,changedFiles,url \
-        2>/dev/null || echo '{"error": "Failed to fetch PR metadata. Is gh CLI authenticated?"}'
-    output: "pr_metadata_raw"
+        2>/dev/null || echo '{"error": "Failed to fetch PR metadata"}'
+    output: "pr_meta"
     parse_json: true
     timeout: 60
 
   - id: "fetch-changed-files"
     type: "bash"
     command: |
-      gh pr diff {{pr_info_raw.pr_number}} \
-        --repo {{pr_info_raw.full_repo}} \
+      gh pr diff {{pr_info.pr_number}} \
+        --repo {{pr_info.full_repo}} \
         --name-only 2>/dev/null | sort -u | head -100
     output: "changed_files"
     timeout: 60
 
-  - id: "summarize-pr"
-    agent: "foundation:explorer"
-    prompt: |
-      Summarize this PR for review context:
-      
-      **PR:** {{pr_info_raw.full_repo}}#{{pr_info_raw.pr_number}}
-      **Title:** {{pr_metadata_raw.title}}
-      **Author:** {{pr_metadata_raw.author.login}}
-      **Branch:** {{pr_metadata_raw.headRefName}} → {{pr_metadata_raw.baseRefName}}
-      **Commit:** {{pr_metadata_raw.headRefOid}}
-      **Stats:** +{{pr_metadata_raw.additions}} -{{pr_metadata_raw.deletions}} ({{pr_metadata_raw.changedFiles}} files)
-      
-      **Description:**
-      {{pr_metadata_raw.body}}
-      
-      **Changed Files:**
-      {{changed_files}}
-      
-      Provide:
-      1. One-paragraph summary of what this PR does
-      2. Key areas to focus review on
-      3. Potential risk areas based on files changed
-      4. Any additional repos that might need to be cloned for full context
-    output: "pr_summary"
-    timeout: 300
-
   # ============================================================================
-  # PHASE 2: CLONE AND SETUP
+  # PHASE 3: CLONE REPOS
   # ============================================================================
 
-  - id: "setup-workspace"
+  - id: "clone-pr-repo"
     type: "bash"
     command: |
-      WORKSPACE="{{workspace_dir}}"
-      mkdir -p "$WORKSPACE"
-      cd "$WORKSPACE"
+      cd "{{paths.workspace}}"
       
-      # Clone PR branch
-      REPO="{{pr_info_raw.full_repo}}"
-      BRANCH="{{pr_metadata_raw.headRefName}}"
-      REPO_DIR="{{pr_info_raw.repo}}"
+      REPO="{{pr_info.full_repo}}"
+      BRANCH="{{pr_meta.headRefName}}"
+      REPO_DIR="{{pr_info.repo}}"
       
       if [ -d "$REPO_DIR" ]; then
-        echo "Repo already cloned, fetching latest..."
+        echo "Repo exists, updating..."
         cd "$REPO_DIR"
         git fetch origin "$BRANCH"
         git checkout "$BRANCH"
@@ -150,425 +101,208 @@ steps:
       else
         echo "Cloning $REPO branch $BRANCH..."
         gh repo clone "$REPO" "$REPO_DIR" -- --branch "$BRANCH"
+        cd "$REPO_DIR"
       fi
       
-      # Verify commit
-      cd "$REPO_DIR"
-      ACTUAL_COMMIT=$(git rev-parse HEAD)
-      EXPECTED_COMMIT="{{pr_metadata_raw.headRefOid}}"
+      ACTUAL=$(git rev-parse HEAD)
+      EXPECTED="{{pr_meta.headRefOid}}"
       
-      echo "Expected commit: $EXPECTED_COMMIT"
-      echo "Actual commit:   $ACTUAL_COMMIT"
+      echo "Expected: $EXPECTED"
+      echo "Actual:   $ACTUAL"
       
-      if [ "$ACTUAL_COMMIT" != "$EXPECTED_COMMIT" ]; then
-        echo "WARNING: Commit mismatch - PR may have been updated"
-      fi
-      
-      echo "Workspace ready: $WORKSPACE/$REPO_DIR"
-      realpath .
-    output: "workspace_path"
+      # Output absolute path
+      pwd
+    output: "pr_repo_path"
     timeout: 300
 
-  - id: "clone-core-for-cross-repo"
+  - id: "clone-core"
     type: "bash"
     command: |
-      cd "{{workspace_dir}}"
+      cd "{{paths.workspace}}"
       
       if [ -d "amplifier-core" ]; then
-        echo "Core already cloned, fetching latest..."
+        echo "Core exists, updating..."
         cd amplifier-core && git fetch origin main && git checkout main && git pull
       else
-        echo "Cloning amplifier-core for cross-repo analysis..."
+        echo "Cloning amplifier-core..."
         gh repo clone microsoft/amplifier-core
+        cd amplifier-core
       fi
       
-      echo "Core cloned for cross-repo contract verification"
-    output: "core_clone_result"
+      pwd
+    output: "core_path"
     timeout: 180
 
-  - id: "cross-repo-usage-check"
-    type: "agent"
+  # ============================================================================
+  # PHASE 4: CROSS-REPO CONTRACT CHECK
+  # ============================================================================
+
+  - id: "cross-repo-check"
     agent: "foundation:explorer"
     prompt: |
       CRITICAL: Check for cross-repo contract violations.
       
-      The PR modifies files in: {{workspace_dir}}/{{pr_info_raw.repo}}
-      Core is cloned at: {{workspace_dir}}/amplifier-core
+      PR repo: {{pr_repo_path}}
+      Core repo: {{core_path}}
       
-      Your task:
-      1. Identify any function signatures, class methods, or Protocol implementations 
-         that changed in the PR (especially in resolvers.py, session_runner.py, or 
-         any file with "resolver" or "protocol" in the name)
+      1. Find function/method signature changes in the PR (especially resolvers, protocols)
+      2. Search core for usages of those interfaces
+      3. Flag if core calls methods with parameters the PR removed
       
-      2. Search amplifier-core for usages of those changed interfaces:
-         - Look in amplifier_core/loader.py
-         - Look in amplifier_core/session.py
-         - Grep for the function/method names that changed
-      
-      3. Flag any potential contract violations where:
-         - Core calls a method with parameters the PR removed
-         - Core expects a return type the PR changed
-         - Core imports something the PR deleted
-      
-      This check exists because PR #65 removed 'profile_hint' from AppModuleResolver
-      but amplifier-core still called resolve() with profile_hint=, causing a crash.
-      
-      Report findings as: SAFE (no cross-repo issues) or WARNING (potential violations found)
-    output: "cross_repo_check"
+      Report: SAFE or WARNING with details
+    output: "cross_repo_result"
     timeout: 300
 
   # ============================================================================
-  # PHASE 3: SHADOW ENVIRONMENT ANALYSIS
+  # PHASE 5: SHADOW ENVIRONMENT TESTING
   # ============================================================================
 
   - id: "create-shadow"
     type: "bash"
     condition: "{{skip_shadow_tests}} != true"
     command: |
-      echo "=== Creating shadow environment with LOCAL PR code ==="
+      echo "Creating shadow with local PR code..."
+      echo "PR repo path: {{pr_repo_path}}"
       
-      # Get absolute path to the PR repo
-      PR_REPO_PATH=$(cd "{{workspace_dir}}/{{pr_info_raw.repo}}" && pwd)
-      
-      # Create shadow with local source
       amplifier tool invoke shadow \
         operation=create \
-        name="pr-review-{{pr_info_raw.pr_number}}" \
-        local_sources="[\"${PR_REPO_PATH}:{{pr_info_raw.full_repo}}\"]"
-    output: "shadow_create_output"
+        name="pr-review-{{pr_info.pr_number}}" \
+        local_sources="[\"{{pr_repo_path}}:{{pr_info.full_repo}}\"]"
+    output: "shadow"
     parse_json: true
     timeout: 300
 
-  - id: "shadow-install-amplifier"
+  - id: "shadow-install"
     type: "bash"
     condition: "{{skip_shadow_tests}} != true"
     command: |
-      echo "=== Installing Amplifier from LOCAL PR clone ==="
+      echo "Installing Amplifier from LOCAL clone..."
       
-      # Install from the pre-cloned workspace path, NOT from GitHub
-      # This ensures we test the EXACT PR code, bypassing UV cache issues
       amplifier tool invoke shadow \
         operation=exec \
-        shadow_id="{{shadow_create_output.shadow_id}}" \
-        command="uv tool install /workspace/{{pr_info_raw.full_repo}}"
+        shadow_id="{{shadow.shadow_id}}" \
+        command="uv tool install /workspace/{{pr_info.full_repo}} && amplifier --version"
       
       echo ""
-      echo "=== Verifying installation ==="
+      echo "Installing providers..."
       amplifier tool invoke shadow \
         operation=exec \
-        shadow_id="{{shadow_create_output.shadow_id}}" \
-        command="amplifier --version"
+        shadow_id="{{shadow.shadow_id}}" \
+        command="amplifier provider install -q 2>/dev/null || true"
       
       echo ""
-      echo "=== Installing providers ==="
+      echo "Installing smoke test bundle..."
       amplifier tool invoke shadow \
         operation=exec \
-        shadow_id="{{shadow_create_output.shadow_id}}" \
-        command="amplifier provider install -q 2>/dev/null || echo 'Provider install skipped'"
-      
-      echo ""
-      echo "=== Installing smoke test bundle ==="
-      amplifier tool invoke shadow \
-        operation=exec \
-        shadow_id="{{shadow_create_output.shadow_id}}" \
+        shadow_id="{{shadow.shadow_id}}" \
         command="amplifier bundle add git+https://github.com/samueljklee/amplifier-bundle-smoke-test --app"
-    output: "shadow_install_result"
+    output: "install_result"
     timeout: 600
-
-  - id: "shadow-verify-commit"
-    type: "bash"
-    condition: "{{skip_shadow_tests}} != true"
-    command: |
-      echo "=== Verifying installed commit matches PR ==="
-      
-      EXPECTED_SHORT="{{pr_metadata_raw.headRefOid}}"
-      EXPECTED_SHORT="${EXPECTED_SHORT:0:7}"
-      
-      amplifier tool invoke shadow \
-        operation=exec \
-        shadow_id="{{shadow_create_output.shadow_id}}" \
-        command="INSTALLED=\$(amplifier --version 2>/dev/null | grep -oE '[a-f0-9]{7,}' | tail -1); echo \"Installed: \$INSTALLED\"; echo \"Expected: ${EXPECTED_SHORT}\"; if [[ \"\$INSTALLED\" == \"${EXPECTED_SHORT}\"* ]] || [[ \"${EXPECTED_SHORT}\" == \"\$INSTALLED\"* ]]; then echo 'VERIFIED: Commit matches'; else echo 'WARNING: Commit mismatch'; fi"
-    output: "commit_verification"
-    timeout: 60
 
   - id: "shadow-smoke-test"
     type: "bash"
     condition: "{{skip_shadow_tests}} != true"
     command: |
-      echo "=== Running Full Smoke Test Suite ==="
+      echo "Running smoke tests..."
       
-      # Run the actual smoke test recipe inside the shadow
       amplifier tool invoke shadow \
         operation=exec \
-        shadow_id="{{shadow_create_output.shadow_id}}" \
+        shadow_id="{{shadow.shadow_id}}" \
         command="amplifier tool invoke recipes operation=execute recipe_path=@smoke-test:recipes/smoke-test.yaml context='{\"skip_llm\": {{skip_llm_smoke}}}'"
-    output: "smoke_test_results"
+    output: "smoke_results"
     timeout: 900
 
   - id: "destroy-shadow"
     type: "bash"
     condition: "{{skip_shadow_tests}} != true"
     command: |
-      echo "=== Cleaning up shadow environment ==="
       amplifier tool invoke shadow \
         operation=destroy \
-        shadow_id="{{shadow_create_output.shadow_id}}"
-    output: "shadow_cleanup"
+        shadow_id="{{shadow.shadow_id}}"
+    output: "cleanup"
     on_error: "continue"
     timeout: 60
 
   # ============================================================================
-  # PHASE 4: CODE REVIEW (on local clone)
+  # PHASE 6: CODE REVIEW
   # ============================================================================
 
   - id: "code-review"
     agent: "foundation:zen-architect"
     mode: "REVIEW"
     prompt: |
-      Review the PR changes for code quality and architecture concerns.
+      Review PR for code quality and architecture.
       
-      **PR Context:**
-      {{pr_summary}}
+      **PR:** {{pr_info.full_repo}}#{{pr_info.pr_number}} - {{pr_meta.title}}
+      **Changed files:** {{changed_files}}
+      **Repo path:** {{pr_repo_path}}
       
-      **Changed Files:**
-      {{changed_files}}
-      
-      **Repository Path:** {{workspace_dir}}/{{pr_info_raw.repo}}
-      
-      Please review the changed files and provide:
-      
-      1. **Architecture Assessment**
-         - Does this follow Amplifier's modular design philosophy?
-         - Are there unnecessary abstractions or complexity?
-         - Is the code well-organized?
-      
-      2. **Code Quality Issues**
-         - Anti-patterns or code smells
-         - Complexity hotspots
-         - Missing error handling
-         - Potential bugs
-      
-      3. **Amplifier-Specific Concerns**
-         - Does this follow kernel philosophy (if touching core)?
-         - Are contracts/protocols maintained?
-         - Bundle compatibility implications?
-      
-      4. **Recommendations**
-         - Specific improvements with rationale
-         - Priority (critical/high/medium/low)
-      
-      Focus on substantive issues, not style preferences.
-    output: "code_review_findings"
+      Assess: architecture, code quality, Amplifier-specific concerns.
+      Provide specific recommendations with priority levels.
+    output: "code_review"
     timeout: 600
 
   - id: "security-review"
     agent: "foundation:security-guardian"
     prompt: |
-      Perform a security audit of the PR changes.
+      Security audit of PR changes.
       
-      **PR Context:**
-      {{pr_summary}}
+      **PR:** {{pr_info.full_repo}}#{{pr_info.pr_number}}
+      **Changed files:** {{changed_files}}
+      **Repo path:** {{pr_repo_path}}
       
-      **Changed Files:**
-      {{changed_files}}
-      
-      **Repository Path:** {{workspace_dir}}/{{pr_info_raw.repo}}
-      
-      Check for:
-      
-      1. **OWASP Top 10 Issues**
-         - Injection vulnerabilities
-         - Authentication/authorization issues
-         - Sensitive data exposure
-         - Security misconfiguration
-      
-      2. **CLI-Specific Security**
-         - Command injection risks
-         - Path traversal vulnerabilities
-         - Unsafe subprocess calls
-         - Environment variable handling
-      
-      3. **Secrets and Credentials**
-         - Hardcoded secrets
-         - Unsafe credential handling
-         - Logging sensitive data
-      
-      4. **Dependency Security**
-         - New dependencies added
-         - Known vulnerable packages
-      
-      For each finding: location, severity (critical/high/medium/low), explanation, fix.
-    output: "security_findings"
+      Check: OWASP issues, command injection, path traversal, secrets, dependencies.
+    output: "security_review"
     timeout: 600
 
   - id: "python-check"
     type: "bash"
     command: |
-      echo "=== Running Python quality checks ==="
       amplifier tool invoke python_check \
-        paths="[\"{{workspace_dir}}/{{pr_info_raw.repo}}\"]" \
-        2>&1 || echo "Python check completed with issues"
-    output: "python_check_results"
+        paths="[\"{{pr_repo_path}}\"]" \
+        2>&1 || echo "Python check completed"
+    output: "python_results"
     timeout: 300
 
   # ============================================================================
-  # PHASE 5: GENERATE OUTPUTS
+  # PHASE 7: GENERATE REPORT
   # ============================================================================
 
-  - id: "synthesize-findings"
+  - id: "synthesize"
     agent: "foundation:zen-architect"
     mode: "ARCHITECT"
     prompt: |
-      Synthesize all review findings into a comprehensive PR review report.
+      Create PR review report.
       
-      ## PR Information
-      - **PR:** {{pr_info_raw.full_repo}}#{{pr_info_raw.pr_number}}
-      - **Title:** {{pr_metadata_raw.title}}
-      - **Author:** {{pr_metadata_raw.author.login}}
-      - **Commit:** {{pr_metadata_raw.headRefOid}}
-      - **URL:** {{pr_metadata_raw.url}}
+      ## PR Info
+      - {{pr_info.full_repo}}#{{pr_info.pr_number}}: {{pr_meta.title}}
+      - Author: {{pr_meta.author.login}}
+      - Commit: {{pr_meta.headRefOid}}
       
-      ## PR Summary
-      {{pr_summary}}
+      ## Results
+      - Cross-repo check: {{cross_repo_result}}
+      - Shadow install: {{install_result}}
+      - Smoke tests: {{smoke_results}}
+      - Code review: {{code_review}}
+      - Security: {{security_review}}
+      - Python: {{python_results}}
       
-      ## Cross-Repo Contract Check
-      {{cross_repo_check}}
-      
-      ## Shadow Environment Testing
-      - Install result: {{shadow_install_result}}
-      - Commit verification: {{commit_verification}}
-      - Smoke test results: {{smoke_test_results}}
-      
-      ## Code Review Findings
-      {{code_review_findings}}
-      
-      ## Security Findings
-      {{security_findings}}
-      
-      ## Python Quality Check
-      {{python_check_results}}
-      
-      ---
-      
-      Create a PR review report with:
-      
-      1. **Executive Summary** (2-3 sentences)
-         - Overall assessment: APPROVE / REQUEST_CHANGES / COMMENT
-         - Key concern or highlight
-      
-      2. **Testing Results**
-         - Shadow environment: PASS/FAIL
-         - Smoke tests: PASS/FAIL (note: unconfigured providers like ollama/azure-cli are expected to skip)
-         - Version verification: PASS/FAIL
-         - Cross-repo contract check: SAFE/WARNING
-      
-      3. **Critical Issues** (must fix before merge)
-         - List with locations and specific fixes
-      
-      4. **Suggested Improvements** (should consider)
-         - Prioritized list
-      
-      5. **Positive Observations**
-         - What's done well
-      
-      6. **Manual Testing Recommendations**
-         - Specific scenarios to test
-      
-      Format the output as GitHub-flavored Markdown suitable for posting as a PR comment.
-    output: "review_report"
+      Format as GitHub PR comment with:
+      1. Executive summary (APPROVE/REQUEST_CHANGES/COMMENT)
+      2. Test results (PASS/FAIL)
+      3. Critical issues
+      4. Suggestions
+      5. Positive notes
+    output: "report"
     timeout: 600
 
-  - id: "save-findings"
+  - id: "save-report"
     type: "bash"
     command: |
-      WORKSPACE="{{workspace_dir}}"
-      FINDINGS_FILE="${WORKSPACE}/pr-{{pr_info_raw.pr_number}}-review.md"
+      cat > "{{paths.workspace}}/pr-{{pr_info.pr_number}}-review.md" << 'EOF'
+      {{report}}
+      EOF
       
-      cat > "$FINDINGS_FILE" << 'REVIEW_EOF'
-      {{review_report}}
-      REVIEW_EOF
-      
-      echo "Review findings saved to: $FINDINGS_FILE"
-      realpath "$FINDINGS_FILE"
-    output: "findings_file_path"
-    timeout: 30
-
-  - id: "generate-install-guide"
-    type: "bash"
-    command: |
-      WORKSPACE="{{workspace_dir}}"
-      GUIDE_FILE="${WORKSPACE}/pr-{{pr_info_raw.pr_number}}-optional-manual-install.md"
-      
-      cat > "$GUIDE_FILE" << 'GUIDE_EOF'
-      # Optional: Manual Installation for PR #{{pr_info_raw.pr_number}}
-      
-      **Note:** Shadow environment testing already verified the PR works.
-      Manual installation is only needed if you want hands-on testing with
-      your personal environment (your providers, bundles, settings).
-      
-      Most reviews do NOT require this step.
-      
-      ## PR Information
-      - **Repository:** {{pr_info_raw.full_repo}}
-      - **Branch:** {{pr_metadata_raw.headRefName}}
-      - **Commit:** {{pr_metadata_raw.headRefOid}}
-      
-      ---
-      
-      ## If You Want Manual Testing
-      
-      ### 1. Exit Amplifier and Install PR Version
-      
-      ```bash
-      # Exit your current Amplifier session first, then:
-      uv tool install --force git+https://github.com/{{pr_info_raw.full_repo}}@{{pr_metadata_raw.headRefName}}
-      ```
-      
-      ### 2. Verify Installation
-      
-      ```bash
-      amplifier --version
-      # Should contain: {{pr_metadata_raw.headRefOid}}
-      ```
-      
-      ### 3. Test Specific PR Functionality
-      
-      - {{pr_metadata_raw.title}}
-      
-      ### 4. Restore Official Version (when done)
-      
-      ```bash
-      uv tool install --force git+https://github.com/microsoft/amplifier-app-cli
-      amplifier --version  # Verify restoration
-      ```
-      GUIDE_EOF
-      
-      echo "Optional install guide saved to: $GUIDE_FILE"
-      realpath "$GUIDE_FILE"
-    output: "install_guide_path"
-    timeout: 30
-
-  - id: "final-summary"
-    agent: "foundation:explorer"
-    prompt: |
-      Provide a brief final summary for the user.
-      
-      **PR Review Complete:** {{pr_info_raw.full_repo}}#{{pr_info_raw.pr_number}}
-      
-      **Files Generated:**
-      - Review findings: {{findings_file_path}}
-      - Optional manual install guide: {{install_guide_path}}
-      
-      **Shadow Environment Results (your local Amplifier was NOT modified):**
-      - Smoke tests: {{smoke_test_results}}
-      - Commit verification: {{commit_verification}}
-      - Cross-repo check: {{cross_repo_check}}
-      
-      Provide:
-      1. One-sentence overall assessment
-      2. Next steps: post findings to PR? approve/request changes?
-      3. Note that shadow testing is complete - manual installation is optional and usually not needed
-      
-      Keep it concise - this is the wrap-up message.
+      realpath "{{paths.workspace}}/pr-{{pr_info.pr_number}}-review.md"
     output: "final_output"
-    timeout: 120
+    timeout: 30
