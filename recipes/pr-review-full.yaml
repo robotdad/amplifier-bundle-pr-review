@@ -187,8 +187,10 @@ steps:
       operation: "exec"
       shadow_id: "{{shadow_info.shadow_id}}"
       command: |
-        echo "=== Installing Amplifier with PR code ==="
-        uv tool install git+https://github.com/{{pr_info_raw.full_repo}}
+        echo "=== Installing Amplifier from LOCAL PR clone ==="
+        # Install from the pre-cloned workspace path, NOT from GitHub
+        # This ensures we test the EXACT PR code, bypassing UV cache issues
+        uv tool install /workspace/{{pr_info_raw.full_repo}}
         
         echo ""
         echo "=== Verifying installation ==="
