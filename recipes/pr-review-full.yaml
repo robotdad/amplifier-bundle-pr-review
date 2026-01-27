@@ -1,6 +1,6 @@
 name: "pr-review-full"
 description: "Complete PR review workflow for amplifier-app-cli: fetch, analyze, test, and prepare findings"
-version: "1.0.0"
+version: "2.0.0"
 author: "Amplifier PR Review Bundle"
 tags: ["pr-review", "amplifier", "code-review", "security", "testing"]
 
@@ -13,23 +13,29 @@ tags: ["pr-review", "amplifier", "code-review", "security", "testing"]
 #
 # Phase 2: Clone and Setup
 #   - Clone PR branch to workspace
-#   - Clone any additional needed repos (amplifier-core, etc.)
+#   - Clone amplifier-core for cross-repo contract checking
 #
 # Phase 3: Shadow Environment Analysis (automated, no host changes)
 #   - Create shadow with PR code as local source
+#   - Install Amplifier FROM LOCAL CLONE (not GitHub - avoids UV cache issues)
+#   - Install smoke test bundle
+#   - Run full smoke tests
+#   - Verify PR commit matches installed version
+#
+# Phase 4: Code Review
 #   - Run code quality review (zen-architect)
 #   - Run security audit (security-guardian)
 #   - Run Python checks (ruff, pyright)
-#   - Run smoke tests with PR code installed
-#   - Verify PR commit matches installed version
+#   - Cross-repo contract checking
 #
-# Phase 4: Generate Outputs
+# Phase 5: Generate Outputs
 #   - Save review findings to file
-#   - Generate installation guide for manual testing
-#   - Generate cleanup instructions
+#   - Generate optional manual installation guide
 #
 # Usage:
-#   "Run pr-review-full with pr_url=https://github.com/microsoft/amplifier-app-cli/pull/65"
+#   amplifier tool invoke recipes operation=execute \
+#     recipe_path=@pr-review:recipes/pr-review-full.yaml \
+#     context='{"pr_url": "https://github.com/microsoft/amplifier-app-cli/pull/65"}'
 #
 # Required: GitHub CLI (gh) authenticated, Docker/Podman for shadow environments
 # Typical runtime: 15-30 minutes
@@ -159,13 +165,10 @@ steps:
       fi
       
       echo "Workspace ready: $WORKSPACE/$REPO_DIR"
-      pwd
+      realpath .
     output: "workspace_path"
     timeout: 300
 
-  # ----------------------------------------------------------------------------
-  # Clone amplifier-core for cross-repo contract checking
-  # ----------------------------------------------------------------------------
   - id: "clone-core-for-cross-repo"
     type: "bash"
     command: |
@@ -219,95 +222,99 @@ steps:
   # ============================================================================
 
   - id: "create-shadow"
-    type: "tool"
-    tool: "shadow"
+    type: "bash"
     condition: "{{skip_shadow_tests}} != true"
-    params:
-      operation: "create"
-      local_sources:
-        - "{{workspace_dir}}/{{pr_info_raw.repo}}:{{pr_info_raw.full_repo}}"
-      name: "pr-review-{{pr_info_raw.pr_number}}"
-    output: "shadow_info"
+    command: |
+      echo "=== Creating shadow environment with LOCAL PR code ==="
+      
+      # Get absolute path to the PR repo
+      PR_REPO_PATH=$(cd "{{workspace_dir}}/{{pr_info_raw.repo}}" && pwd)
+      
+      # Create shadow with local source
+      amplifier tool invoke shadow \
+        operation=create \
+        name="pr-review-{{pr_info_raw.pr_number}}" \
+        local_sources="[\"${PR_REPO_PATH}:{{pr_info_raw.full_repo}}\"]"
+    output: "shadow_create_output"
+    parse_json: true
     timeout: 300
 
   - id: "shadow-install-amplifier"
-    type: "tool"
-    tool: "shadow"
+    type: "bash"
     condition: "{{skip_shadow_tests}} != true"
-    params:
-      operation: "exec"
-      shadow_id: "{{shadow_info.shadow_id}}"
-      command: |
-        echo "=== Installing Amplifier from LOCAL PR clone ==="
-        # Install from the pre-cloned workspace path, NOT from GitHub
-        # This ensures we test the EXACT PR code, bypassing UV cache issues
-        uv tool install /workspace/{{pr_info_raw.full_repo}}
-        
-        echo ""
-        echo "=== Verifying installation ==="
-        amplifier --version
-        
-        echo ""
-        echo "=== Installing providers ==="
-        amplifier provider install -q 2>/dev/null || echo "Provider install skipped"
-        
-        echo ""
-        echo "=== Installing smoke test bundle ==="
-        amplifier bundle add git+https://github.com/samueljklee/amplifier-bundle-smoke-test --app
+    command: |
+      echo "=== Installing Amplifier from LOCAL PR clone ==="
+      
+      # Install from the pre-cloned workspace path, NOT from GitHub
+      # This ensures we test the EXACT PR code, bypassing UV cache issues
+      amplifier tool invoke shadow \
+        operation=exec \
+        shadow_id="{{shadow_create_output.shadow_id}}" \
+        command="uv tool install /workspace/{{pr_info_raw.full_repo}}"
+      
+      echo ""
+      echo "=== Verifying installation ==="
+      amplifier tool invoke shadow \
+        operation=exec \
+        shadow_id="{{shadow_create_output.shadow_id}}" \
+        command="amplifier --version"
+      
+      echo ""
+      echo "=== Installing providers ==="
+      amplifier tool invoke shadow \
+        operation=exec \
+        shadow_id="{{shadow_create_output.shadow_id}}" \
+        command="amplifier provider install -q 2>/dev/null || echo 'Provider install skipped'"
+      
+      echo ""
+      echo "=== Installing smoke test bundle ==="
+      amplifier tool invoke shadow \
+        operation=exec \
+        shadow_id="{{shadow_create_output.shadow_id}}" \
+        command="amplifier bundle add git+https://github.com/samueljklee/amplifier-bundle-smoke-test --app"
     output: "shadow_install_result"
     timeout: 600
 
   - id: "shadow-verify-commit"
-    type: "tool"
-    tool: "shadow"
+    type: "bash"
     condition: "{{skip_shadow_tests}} != true"
-    params:
-      operation: "exec"
-      shadow_id: "{{shadow_info.shadow_id}}"
-      command: |
-        INSTALLED_VERSION=$(amplifier --version 2>/dev/null | grep -oE '[a-f0-9]{7,}' | tail -1)
-        EXPECTED_SHORT="{{pr_metadata_raw.headRefOid}}"
-        EXPECTED_SHORT="${EXPECTED_SHORT:0:7}"
-        
-        echo "Installed version commit: $INSTALLED_VERSION"
-        echo "Expected PR commit:       $EXPECTED_SHORT"
-        
-        if [[ "$INSTALLED_VERSION" == "$EXPECTED_SHORT"* ]] || [[ "$EXPECTED_SHORT" == "$INSTALLED_VERSION"* ]]; then
-          echo "VERIFIED: Installed version matches PR commit"
-          echo "MATCH=true"
-        else
-          echo "WARNING: Version mismatch - shadow may be using cached version"
-          echo "MATCH=false"
-        fi
+    command: |
+      echo "=== Verifying installed commit matches PR ==="
+      
+      EXPECTED_SHORT="{{pr_metadata_raw.headRefOid}}"
+      EXPECTED_SHORT="${EXPECTED_SHORT:0:7}"
+      
+      amplifier tool invoke shadow \
+        operation=exec \
+        shadow_id="{{shadow_create_output.shadow_id}}" \
+        command="INSTALLED=\$(amplifier --version 2>/dev/null | grep -oE '[a-f0-9]{7,}' | tail -1); echo \"Installed: \$INSTALLED\"; echo \"Expected: ${EXPECTED_SHORT}\"; if [[ \"\$INSTALLED\" == \"${EXPECTED_SHORT}\"* ]] || [[ \"${EXPECTED_SHORT}\" == \"\$INSTALLED\"* ]]; then echo 'VERIFIED: Commit matches'; else echo 'WARNING: Commit mismatch'; fi"
     output: "commit_verification"
     timeout: 60
 
   - id: "shadow-smoke-test"
-    type: "tool"
-    tool: "shadow"
+    type: "bash"
     condition: "{{skip_shadow_tests}} != true"
-    params:
-      operation: "exec"
-      shadow_id: "{{shadow_info.shadow_id}}"
-      command: |
-        echo "=== Running Full Smoke Test Suite ==="
-        
-        # Run the actual smoke test recipe
-        amplifier tool invoke recipes \
-          operation=execute \
-          recipe_path=@smoke-test:recipes/smoke-test.yaml \
-          context='{"skip_llm": {{skip_llm_smoke}}}'
+    command: |
+      echo "=== Running Full Smoke Test Suite ==="
+      
+      # Run the actual smoke test recipe inside the shadow
+      amplifier tool invoke shadow \
+        operation=exec \
+        shadow_id="{{shadow_create_output.shadow_id}}" \
+        command="amplifier tool invoke recipes operation=execute recipe_path=@smoke-test:recipes/smoke-test.yaml context='{\"skip_llm\": {{skip_llm_smoke}}}'"
     output: "smoke_test_results"
-    timeout: 600
+    timeout: 900
 
   - id: "destroy-shadow"
-    type: "tool"
-    tool: "shadow"
+    type: "bash"
     condition: "{{skip_shadow_tests}} != true"
-    params:
-      operation: "destroy"
-      shadow_id: "{{shadow_info.shadow_id}}"
+    command: |
+      echo "=== Cleaning up shadow environment ==="
+      amplifier tool invoke shadow \
+        operation=destroy \
+        shadow_id="{{shadow_create_output.shadow_id}}"
     output: "shadow_cleanup"
+    on_error: "continue"
     timeout: 60
 
   # ============================================================================
@@ -395,11 +402,12 @@ steps:
     timeout: 600
 
   - id: "python-check"
-    type: "tool"
-    tool: "python_check"
-    params:
-      paths:
-        - "{{workspace_dir}}/{{pr_info_raw.repo}}"
+    type: "bash"
+    command: |
+      echo "=== Running Python quality checks ==="
+      amplifier tool invoke python_check \
+        paths="[\"{{workspace_dir}}/{{pr_info_raw.repo}}\"]" \
+        2>&1 || echo "Python check completed with issues"
     output: "python_check_results"
     timeout: 300
 
@@ -422,6 +430,9 @@ steps:
       
       ## PR Summary
       {{pr_summary}}
+      
+      ## Cross-Repo Contract Check
+      {{cross_repo_check}}
       
       ## Shadow Environment Testing
       - Install result: {{shadow_install_result}}
@@ -447,8 +458,9 @@ steps:
       
       2. **Testing Results**
          - Shadow environment: PASS/FAIL
-         - Smoke tests: PASS/FAIL
+         - Smoke tests: PASS/FAIL (note: unconfigured providers like ollama/azure-cli are expected to skip)
          - Version verification: PASS/FAIL
+         - Cross-repo contract check: SAFE/WARNING
       
       3. **Critical Issues** (must fix before merge)
          - List with locations and specific fixes
@@ -470,14 +482,14 @@ steps:
     type: "bash"
     command: |
       WORKSPACE="{{workspace_dir}}"
-      FINDINGS_FILE="$WORKSPACE/pr-{{pr_info_raw.pr_number}}-review.md"
+      FINDINGS_FILE="${WORKSPACE}/pr-{{pr_info_raw.pr_number}}-review.md"
       
       cat > "$FINDINGS_FILE" << 'REVIEW_EOF'
       {{review_report}}
       REVIEW_EOF
       
       echo "Review findings saved to: $FINDINGS_FILE"
-      echo "$FINDINGS_FILE"
+      realpath "$FINDINGS_FILE"
     output: "findings_file_path"
     timeout: 30
 
@@ -485,7 +497,7 @@ steps:
     type: "bash"
     command: |
       WORKSPACE="{{workspace_dir}}"
-      GUIDE_FILE="$WORKSPACE/pr-{{pr_info_raw.pr_number}}-optional-manual-install.md"
+      GUIDE_FILE="${WORKSPACE}/pr-{{pr_info_raw.pr_number}}-optional-manual-install.md"
       
       cat > "$GUIDE_FILE" << 'GUIDE_EOF'
       # Optional: Manual Installation for PR #{{pr_info_raw.pr_number}}
@@ -532,7 +544,7 @@ steps:
       GUIDE_EOF
       
       echo "Optional install guide saved to: $GUIDE_FILE"
-      echo "$GUIDE_FILE"
+      realpath "$GUIDE_FILE"
     output: "install_guide_path"
     timeout: 30
 
@@ -550,6 +562,7 @@ steps:
       **Shadow Environment Results (your local Amplifier was NOT modified):**
       - Smoke tests: {{smoke_test_results}}
       - Commit verification: {{commit_verification}}
+      - Cross-repo check: {{cross_repo_check}}
       
       Provide:
       1. One-sentence overall assessment
@@ -557,5 +570,5 @@ steps:
       3. Note that shadow testing is complete - manual installation is optional and usually not needed
       
       Keep it concise - this is the wrap-up message.
-    output: "final_summary"
+    output: "final_output"
     timeout: 120

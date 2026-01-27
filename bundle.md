@@ -1,7 +1,7 @@
 ---
 bundle:
   name: pr-review
-  version: 1.0.0
+  version: 2.0.0
   description: Comprehensive PR review workflow for amplifier-app-cli submissions
 
 includes:
@@ -30,11 +30,6 @@ tools:
     source: git+https://github.com/microsoft/amplifier-module-tool-search@main
   - module: tool-web
     source: git+https://github.com/microsoft/amplifier-module-tool-web@main
-
-# PR Review specific agents
-agents:
-  pr-reviewer:
-    path: pr-review:agents/pr-reviewer.md
 ---
 
 # Amplifier PR Review Bundle
@@ -43,40 +38,67 @@ Comprehensive workflow for reviewing Pull Requests to amplifier-app-cli (and oth
 
 ## Quick Start
 
-```
-"Help me review the PR at https://github.com/microsoft/amplifier-app-cli/pull/65"
+```bash
+mkdir pr-65 && cd pr-65
+amplifier
 ```
 
-The PR reviewer agent will guide you through the entire process.
+Then in the session:
+```
+Run the pr-review-full recipe with pr_url=https://github.com/microsoft/amplifier-app-cli/pull/65
+```
+
+Or directly via CLI:
+```bash
+amplifier tool invoke recipes \
+  operation=execute \
+  recipe_path=@pr-review:recipes/pr-review-full.yaml \
+  context='{"pr_url": "https://github.com/microsoft/amplifier-app-cli/pull/65"}'
+```
 
 ## What This Bundle Does
 
+The `pr-review-full` recipe performs a complete, deterministic PR review:
+
 1. **Fetches PR information** from GitHub URL
-2. **Clones the PR branch** and any needed Amplifier repos
-3. **Runs automated analysis** in shadow environment:
-   - Code quality review (zen-architect)
-   - Security audit (security-guardian)
-   - Python code checks (ruff, pyright)
-   - Smoke tests with PR code
-4. **Generates installation guide** for manual testing
-5. **Saves review findings** for later posting
-6. **Posts findings to PR** via GitHub CLI
-7. **Provides cleanup instructions** to restore official install
+2. **Clones the PR branch** to local workspace
+3. **Clones amplifier-core** for cross-repo contract checking
+4. **Cross-repo analysis** - checks if PR breaks any contracts core depends on
+5. **Creates shadow environment** with LOCAL PR code (not GitHub - avoids UV cache issues)
+6. **Installs Amplifier from local clone** inside shadow
+7. **Runs full smoke test suite** inside shadow
+8. **Code quality review** (zen-architect)
+9. **Security audit** (security-guardian)
+10. **Python checks** (ruff, pyright)
+11. **Generates review report** and optional manual install guide
+
+## Why Recipe-Only (No Agent)
+
+Previous versions had a `pr-reviewer` agent that was supposed to invoke the recipe.
+The agent repeatedly went rogue and did manual ad-hoc work instead.
+
+Now there's just the recipe - deterministic, same steps every time.
 
 ## Available Recipes
 
 | Recipe | Purpose |
 |--------|---------|
 | `pr-review-full.yaml` | Complete automated review workflow |
-| `pr-review-shadow-test.yaml` | Shadow environment testing only |
-| `pr-review-post-findings.yaml` | Post saved findings to GitHub PR |
-| `pr-review-cleanup.yaml` | Restore official Amplifier install |
 
-## Available Agents
+## Context Options
 
-| Agent | Purpose |
-|-------|---------|
-| `pr-review:pr-reviewer` | Interactive PR review guide |
+| Option | Default | Description |
+|--------|---------|-------------|
+| `pr_url` | (required) | Full GitHub PR URL |
+| `workspace_dir` | `./pr-review` | Where to clone repos |
+| `skip_shadow_tests` | `false` | Skip shadow environment tests |
+| `skip_llm_smoke` | `false` | Skip LLM smoke tests (providers that aren't configured will skip anyway) |
+
+## Prerequisites
+
+- **GitHub CLI (gh)**: Must be installed and authenticated
+- **Docker/Podman**: Required for shadow environments
+- **Provider credentials**: For LLM-based smoke tests (optional - unconfigured providers skip)
 
 ## Context Files
 
