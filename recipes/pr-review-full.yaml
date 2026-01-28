@@ -368,13 +368,34 @@ steps:
       
       If it shows a different commit, STOP and report failure.
       
-      ### 4. Install Amplifier from Injected Code
+      ### 4. Install Smoke Test Bundle FIRST
+      
+      **IMPORTANT**: Install the bundle BEFORE installing the PR code. The bundle pulls
+      dependencies from @main which may install a different amplifier version. We install
+      the bundle first so that step 5 overwrites with the correct PR version.
       
       ```
-      shadow(operation="exec", shadow_id="<id>", command="uv tool install /workspace/{{pr_info.full_repo}}")
+      shadow(operation="exec", shadow_id="<id>", command="uv tool install git+https://github.com/microsoft/amplifier-app-cli")
       ```
       
-      ### 5. Verify Installed Version
+      This gives us a working amplifier to run bundle commands:
+      ```
+      shadow(operation="exec", shadow_id="<id>", command="amplifier provider install -q")
+      shadow(operation="exec", shadow_id="<id>", command="amplifier bundle add git+https://github.com/samueljklee/amplifier-bundle-smoke-test --app")
+      ```
+      
+      ### 5. NOW Install PR Code (Overwrites Bundle's Version)
+      
+      **CRITICAL**: This step MUST come AFTER bundle installation to ensure the PR code
+      is what actually runs during smoke tests.
+      
+      ```
+      shadow(operation="exec", shadow_id="<id>", command="uv tool install --force /workspace/{{pr_info.full_repo}}")
+      ```
+      
+      Note: `--force` ensures it overwrites the version installed by the bundle.
+      
+      ### 6. Verify Installed Version
       
       ```
       shadow(operation="exec", shadow_id="<id>", command="amplifier --version")
@@ -382,32 +403,26 @@ steps:
       
       **MUST show**: `{{baseline.local_pr_commit_short}}` in the version string.
       
-      ### 6. Install Providers
+      If it shows a DIFFERENT commit, STOP and report failure. The PR code was not installed correctly.
       
-      ```
-      shadow(operation="exec", shadow_id="<id>", command="amplifier provider install -q")
-      ```
-      
-      ### 7. Install Smoke Test Bundle
-      
-      ```
-      shadow(operation="exec", shadow_id="<id>", command="amplifier bundle add git+https://github.com/samueljklee/amplifier-bundle-smoke-test --app")
-      ```
-      
-      ### 8. Run Smoke Tests
+      ### 7. Run Smoke Tests
       
       ```
       shadow(operation="exec", shadow_id="<id>", command="amplifier tool invoke recipes operation=execute recipe_path=@smoke-test:recipes/smoke-test.yaml context='{\"skip_llm\": {{skip_llm_smoke}}}'")
       ```
       
-      ### 9. Final Version Check
+      ### 8. Final Version Check
       
-      Verify version hasn't changed:
+      Verify version hasn't changed during smoke tests:
       ```
       shadow(operation="exec", shadow_id="<id>", command="amplifier --version")
       ```
       
-      ### 10. Cleanup
+      **MUST still show**: `{{baseline.local_pr_commit_short}}`
+      
+      If version changed, flag this as a concern - something in the smoke tests reinstalled amplifier.
+      
+      ### 9. Cleanup
       
       Destroy shadow (or preserve if failed for debugging).
       
