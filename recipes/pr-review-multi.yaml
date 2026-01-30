@@ -1,0 +1,619 @@
+name: "pr-review-multi"
+description: "Review multiple related PRs together with integrated shadow testing"
+version: "1.0.0"
+author: "Amplifier PR Review Bundle"
+tags: ["pr-review", "amplifier", "multi-repo", "testing"]
+
+# Usage:
+#   amplifier tool invoke recipes operation=execute \
+#     recipe_path=@pr-review:recipes/pr-review-multi.yaml \
+#     context='{
+#       "pr_urls": [
+#         "https://github.com/microsoft/amplifier-bundle-recipes/pull/19",
+#         "https://github.com/microsoft/amplifier-bundle-modes/pull/3"
+#       ]
+#     }'
+
+context:
+  # List of PR URLs to review together
+  pr_urls: []
+  
+  # Optional: Specify dependency order manually (repo names, first = installed first)
+  # If not provided, will be auto-detected from bundle includes
+  dependency_order: []
+  
+  workspace_base: "./pr-review-multi"
+  skip_shadow_tests: false
+  skip_llm_smoke: false
+  
+  # Optional: Also test with the CLI repo (useful when bundles affect CLI behavior)
+  include_cli: false
+  cli_branch: "main"
+
+steps:
+  # ============================================================================
+  # PHASE 1: PARSE AND VALIDATE ALL PR URLs
+  # ============================================================================
+
+  - id: "init-workspace"
+    type: "bash"
+    command: |
+      set -e
+      mkdir -p "{{workspace_base}}"
+      cd "{{workspace_base}}"
+      echo "{\"workspace\": \"$(pwd)\"}"
+    output: "paths"
+    parse_json: true
+    timeout: 30
+
+  - id: "parse-pr-urls"
+    type: "bash"
+    command: |
+      set -e
+      
+      # Parse all PR URLs into a JSON array
+      PR_URLS='{{pr_urls}}'
+      
+      # Handle both JSON array and comma-separated string formats
+      if echo "$PR_URLS" | grep -q '^\['; then
+        # Already JSON array - extract URLs
+        URLS=$(echo "$PR_URLS" | jq -r '.[]' 2>/dev/null || echo "$PR_URLS" | tr -d '[]"' | tr ',' '\n')
+      else
+        # Comma-separated or single URL
+        URLS=$(echo "$PR_URLS" | tr ',' '\n')
+      fi
+      
+      PARSED="[]"
+      
+      for URL in $URLS; do
+        URL=$(echo "$URL" | tr -d ' ')
+        [ -z "$URL" ] && continue
+        
+        if [[ ! "$URL" =~ github\.com/([^/]+)/([^/]+)/pull/([0-9]+) ]]; then
+          echo "ERROR: Invalid PR URL: $URL" >&2
+          exit 1
+        fi
+        
+        OWNER="${BASH_REMATCH[1]}"
+        REPO="${BASH_REMATCH[2]}"
+        PR_NUM="${BASH_REMATCH[3]}"
+        FULL_REPO="${OWNER}/${REPO}"
+        
+        PARSED=$(echo "$PARSED" | jq --arg url "$URL" \
+          --arg owner "$OWNER" --arg repo "$REPO" \
+          --arg pr "$PR_NUM" --arg full "$FULL_REPO" \
+          '. + [{"url": $url, "owner": $owner, "repo": $repo, "pr_number": $pr, "full_repo": $full}]')
+      done
+      
+      COUNT=$(echo "$PARSED" | jq 'length')
+      if [ "$COUNT" -eq 0 ]; then
+        echo "ERROR: No valid PR URLs provided" >&2
+        exit 1
+      fi
+      
+      echo "Parsed $COUNT PR URLs" >&2
+      echo "$PARSED" | jq -c '.'
+    output: "parsed_prs"
+    parse_json: true
+    timeout: 30
+
+  # ============================================================================
+  # PHASE 2: FETCH METADATA FOR ALL PRs
+  # ============================================================================
+
+  - id: "fetch-all-pr-metadata"
+    type: "bash"
+    command: |
+      set -e
+      
+      PARSED='{{parsed_prs}}'
+      METADATA="[]"
+      
+      for ROW in $(echo "$PARSED" | jq -c '.[]'); do
+        FULL_REPO=$(echo "$ROW" | jq -r '.full_repo')
+        PR_NUM=$(echo "$ROW" | jq -r '.pr_number')
+        OWNER=$(echo "$ROW" | jq -r '.owner')
+        REPO=$(echo "$ROW" | jq -r '.repo')
+        
+        echo "Fetching metadata for $FULL_REPO#$PR_NUM..." >&2
+        
+        META=$(gh pr view "$PR_NUM" --repo "$FULL_REPO" \
+          --json title,body,headRefName,headRefOid,baseRefName,author,additions,deletions,changedFiles,url)
+        
+        # Get changed files
+        FILES=$(gh pr diff "$PR_NUM" --repo "$FULL_REPO" --name-only | sort -u | head -100 | jq -R -s 'split("\n") | map(select(length > 0))')
+        
+        # Merge with parsed info
+        COMBINED=$(echo "$META" | jq --arg owner "$OWNER" --arg repo "$REPO" \
+          --arg pr "$PR_NUM" --arg full "$FULL_REPO" --argjson files "$FILES" \
+          '. + {"owner": $owner, "repo": $repo, "pr_number": $pr, "full_repo": $full, "changed_files": $files}')
+        
+        METADATA=$(echo "$METADATA" | jq --argjson item "$COMBINED" '. + [$item]')
+      done
+      
+      echo "$METADATA" | jq -c '.'
+    output: "all_pr_metadata"
+    parse_json: true
+    timeout: 180
+
+  # ============================================================================
+  # PHASE 3: CLONE ALL PR REPOS
+  # ============================================================================
+
+  - id: "clone-all-repos"
+    type: "bash"
+    command: |
+      set -e
+      cd "{{paths.workspace}}"
+      
+      METADATA='{{all_pr_metadata}}'
+      CLONE_PATHS="{}"
+      
+      for ROW in $(echo "$METADATA" | jq -c '.[]'); do
+        FULL_REPO=$(echo "$ROW" | jq -r '.full_repo')
+        REPO=$(echo "$ROW" | jq -r '.repo')
+        COMMIT=$(echo "$ROW" | jq -r '.headRefOid')
+        
+        echo "Cloning $FULL_REPO at $COMMIT..." >&2
+        
+        if [ -d "$REPO" ]; then
+          echo "  Repo exists, fetching..." >&2
+          cd "$REPO"
+          git fetch origin >&2
+        else
+          echo "  Cloning..." >&2
+          gh repo clone "$FULL_REPO" "$REPO" >&2
+          cd "$REPO"
+        fi
+        
+        # Fetch and checkout the specific commit
+        git fetch origin "$COMMIT" >&2 2>&1 || git fetch --unshallow origin >&2 2>&1 || true
+        git checkout "$COMMIT" >&2
+        
+        ACTUAL=$(git rev-parse HEAD)
+        if [ "$ACTUAL" != "$COMMIT" ]; then
+          echo "ERROR: Commit mismatch for $REPO - expected $COMMIT, got $ACTUAL" >&2
+          exit 1
+        fi
+        
+        CLONE_PATH=$(pwd)
+        cd "{{paths.workspace}}"
+        
+        CLONE_PATHS=$(echo "$CLONE_PATHS" | jq --arg repo "$REPO" --arg path "$CLONE_PATH" \
+          '. + {($repo): $path}')
+        
+        echo "  Cloned to $CLONE_PATH" >&2
+      done
+      
+      echo "$CLONE_PATHS" | jq -c '.'
+    output: "clone_paths"
+    parse_json: true
+    timeout: 600
+
+  # ============================================================================
+  # PHASE 4: GENERATE MOUNT PLAN
+  # ============================================================================
+
+  - id: "generate-mount-plan"
+    agent: "foundation:explorer"
+    prompt: |
+      Analyze the cloned PR repos and generate a mount plan for shadow environment testing.
+      
+      ## PR Metadata
+      {{all_pr_metadata}}
+      
+      ## Clone Paths
+      {{clone_paths}}
+      
+      ## Tasks
+      
+      1. **For each cloned repo**, read its `bundle.md` file (if it exists) and identify:
+         - What bundles it includes (look for `includes:` section with git URLs)
+         - What modules it provides (tools, hooks, providers)
+         - Any git URL references to other repos in our PR list
+      
+      2. **Determine dependency order**:
+         - If repo A's bundle.md references repo B, then B must be installed first
+         - Look for patterns like `git+https://github.com/{owner}/{repo}` in bundle files
+         - Check if any referenced repos are in our PR list
+      
+      3. **Build the mount plan** as JSON with this structure:
+      
+      ```json
+      {
+        "sources": [
+          {
+            "repo": "owner/repo-name",
+            "pr_number": "N",
+            "commit": "full-sha",
+            "commit_short": "short-sha",
+            "local_path": "/absolute/path/to/clone",
+            "local_source_spec": "/path:owner/repo-name",
+            "is_bundle": true,
+            "bundle_name": "name-from-bundle.md"
+          }
+        ],
+        "dependency_order": ["repo-name-1", "repo-name-2"],
+        "cross_references": [
+          {"from": "repo-a", "to": "repo-b", "type": "bundle-include"}
+        ],
+        "git_rewrites_needed": [
+          "github.com/owner/repo-name"
+        ]
+      }
+      ```
+      
+      4. **Output ONLY the JSON** - no explanation, just the mount plan JSON.
+      
+      ## Manual Override
+      
+      If a manual dependency order was specified, use it:
+      {{dependency_order}}
+    output: "mount_plan"
+    parse_json: true
+    timeout: 300
+
+  # ============================================================================
+  # PHASE 5: CODE ANALYSIS (before shadow tests)
+  # ============================================================================
+
+  - id: "cross-repo-analysis"
+    agent: "foundation:explorer"
+    prompt: |
+      Analyze cross-repo interactions between all PRs.
+      
+      ## PRs Being Analyzed
+      {{all_pr_metadata}}
+      
+      ## Clone Paths
+      {{clone_paths}}
+      
+      ## Mount Plan
+      {{mount_plan}}
+      
+      ## Tasks
+      
+      1. For each PR, examine the changed files
+      2. Check if any changes affect interfaces/APIs that other PRs depend on
+      3. Look for:
+         - Shared module dependencies
+         - Event names that must match
+         - Configuration keys that must align
+         - Import paths that must be consistent
+      
+      4. Identify any potential integration issues where:
+         - One PR assumes behavior the other PR changes
+         - Version requirements conflict
+         - Module loading order matters
+      
+      ## Output Format
+      
+      ```
+      ## Cross-PR Analysis
+      
+      ### Dependency Graph
+      [which PR depends on which]
+      
+      ### Integration Points
+      [specific interfaces/APIs that connect the PRs]
+      
+      ### Potential Issues
+      [any conflicts or concerns]
+      
+      ### VERDICT: COMPATIBLE / WARNING / CONFLICT
+      [summary assessment]
+      ```
+    output: "cross_repo_analysis"
+    timeout: 300
+
+  - id: "individual-reviews"
+    agent: "foundation:zen-architect"
+    mode: "REVIEW"
+    prompt: |
+      Review all PRs for code quality and architecture.
+      
+      ## PRs
+      {{all_pr_metadata}}
+      
+      ## Clone Paths  
+      {{clone_paths}}
+      
+      For each PR, assess:
+      - Architecture and design patterns
+      - Code quality and readability
+      - Amplifier ecosystem alignment
+      - Potential issues
+      
+      Provide a combined review with sections for each PR.
+    output: "code_reviews"
+    timeout: 600
+
+  # ============================================================================
+  # PHASE 6: SHADOW ENVIRONMENT TESTING WITH ALL PRs
+  # ============================================================================
+
+  - id: "pre-shadow-baseline"
+    type: "bash"
+    condition: "{{skip_shadow_tests}} != true"
+    command: |
+      set -e
+      
+      HOST_VERSION=$(amplifier --version 2>&1 || echo "NOT_INSTALLED")
+      
+      # Verify all clones match expected commits
+      CLONE_PATHS='{{clone_paths}}'
+      METADATA='{{all_pr_metadata}}'
+      
+      VERIFICATIONS="{}"
+      
+      for REPO in $(echo "$CLONE_PATHS" | jq -r 'keys[]'); do
+        PATH=$(echo "$CLONE_PATHS" | jq -r --arg r "$REPO" '.[$r]')
+        EXPECTED=$(echo "$METADATA" | jq -r --arg r "$REPO" '.[] | select(.repo == $r) | .headRefOid')
+        
+        cd "$PATH"
+        ACTUAL=$(git rev-parse HEAD)
+        SHORT=$(git rev-parse --short HEAD)
+        
+        if [ "$ACTUAL" != "$EXPECTED" ]; then
+          echo "ERROR: Commit mismatch for $REPO" >&2
+          exit 1
+        fi
+        
+        VERIFICATIONS=$(echo "$VERIFICATIONS" | jq --arg r "$REPO" \
+          --arg commit "$ACTUAL" --arg short "$SHORT" --arg path "$PATH" \
+          '. + {($r): {"commit": $commit, "short": $short, "path": $path, "verified": true}}')
+      done
+      
+      jq -n --arg host "$HOST_VERSION" --argjson repos "$VERIFICATIONS" \
+        '{"host_version": $host, "repos": $repos}'
+    output: "baseline"
+    parse_json: true
+    timeout: 60
+
+  - id: "shadow-multi-test"
+    condition: "{{skip_shadow_tests}} != true"
+    agent: "shadow-operator"
+    prompt: |
+      ## MULTI-PR SHADOW ENVIRONMENT TEST
+      
+      Test multiple related PRs together in an isolated container.
+      
+      ---
+      
+      ## MOUNT PLAN
+      
+      {{mount_plan}}
+      
+      ## BASELINE (verified commits)
+      
+      {{baseline}}
+      
+      ## PR METADATA
+      
+      {{all_pr_metadata}}
+      
+      ---
+      
+      ## STRATEGY: USE local_sources FOR BUNDLES
+      
+      Unlike CLI testing (which requires inject due to UV caching), bundle testing
+      CAN use `local_sources` because `amplifier bundle add` uses git clone, which
+      respects the URL rewrites.
+      
+      ### Step 1: Build local_sources Array
+      
+      From the mount plan, construct the local_sources parameter:
+      ```
+      local_sources = [
+        "{path}:{owner}/{repo}",
+        ...
+      ]
+      ```
+      
+      For each source in mount_plan.sources, add:
+      `"{local_path}:{repo}"` where repo is the full_repo (owner/repo-name)
+      
+      ### Step 2: Create Shadow with All Sources
+      
+      ```
+      shadow(operation="create", name="multi-pr-test", local_sources=[...all sources...])
+      ```
+      
+      This sets up git URL rewrites for ALL repos simultaneously.
+      
+      ### Step 3: Verify Snapshots
+      
+      Check the returned `snapshot_commits` matches our baseline:
+      - Each repo in baseline.repos should have matching commit in snapshot_commits
+      
+      ### Step 4: Install Base Amplifier CLI
+      
+      ```
+      shadow(operation="exec", command="uv tool install git+https://github.com/microsoft/amplifier-app-cli")
+      shadow(operation="exec", command="amplifier provider install -q")
+      ```
+      
+      ### Step 5: Add Bundles in Dependency Order
+      
+      Follow mount_plan.dependency_order. For each bundle:
+      
+      ```
+      shadow(operation="exec", command="amplifier bundle add git+https://github.com/{full_repo}")
+      ```
+      
+      The git URL rewriting will redirect to local Gitea with our PR code!
+      
+      ### Step 6: Verify Bundle Installation
+      
+      ```
+      shadow(operation="exec", command="amplifier bundle list")
+      ```
+      
+      Each bundle should appear in the list.
+      
+      ### Step 7: Verify Local Code Is Used
+      
+      For each bundle repo, check the cached bundle location contains our commit:
+      ```
+      shadow(operation="exec", command="ls ~/.amplifier/cache/ | grep {repo-name}")
+      shadow(operation="exec", command="cd ~/.amplifier/cache/amplifier-bundle-{name}-* && git rev-parse --short HEAD")
+      ```
+      
+      Must match baseline.repos[repo].short
+      
+      ### Step 8: Install Smoke Test Bundle
+      
+      ```
+      shadow(operation="exec", command="amplifier bundle add git+https://github.com/samueljklee/amplifier-bundle-smoke-test --app")
+      ```
+      
+      ### Step 9: Run Smoke Tests
+      
+      ```
+      shadow(operation="exec", command="amplifier tool invoke recipes operation=execute recipe_path=@smoke-test:recipes/smoke-test.yaml context='{\"skip_llm\": {{skip_llm_smoke}}}'")
+      ```
+      
+      ### Step 10: Run Per-Repo Smoke Tests (if defined)
+      
+      For each repo in mount_plan.sources, check if it defines its own smoke tests:
+      ```
+      shadow(operation="exec", command="ls /workspace/{full_repo}/smoke-tests/ 2>/dev/null || echo 'no smoke-tests'")
+      ```
+      
+      If a `smoke-tests/smoke-test.yaml` exists, run it:
+      ```
+      shadow(operation="exec", command="amplifier tool invoke recipes operation=execute recipe_path=/workspace/{full_repo}/smoke-tests/smoke-test.yaml")
+      ```
+      
+      Collect results from all per-repo smoke tests.
+      
+      ### Step 11: Cleanup
+      
+      Destroy shadow (or preserve if failed for debugging).
+      
+      ---
+      
+      ## REQUIRED OUTPUT FORMAT
+      
+      ```markdown
+      ## Multi-PR Shadow Test Results
+      
+      ### PRs Tested
+      | Repo | PR | Commit | Status |
+      |------|-----|--------|--------|
+      | {repo} | #{number} | {short} | PASS/FAIL |
+      
+      ### Source Verification
+      | Repo | Expected | Snapshot | Installed | Status |
+      |------|----------|----------|-----------|--------|
+      | ... | ... | ... | ... | PASS/FAIL |
+      
+      ### Bundle Installation
+      - {bundle-1}: PASS/FAIL
+      - {bundle-2}: PASS/FAIL
+      
+      ### Smoke Test Results
+      {output from standard smoke tests}
+      
+      ### Per-Repo Smoke Tests
+      | Repo | Has Tests | Result |
+      |------|-----------|--------|
+      | {repo} | yes/no | PASS/FAIL/SKIPPED |
+      
+      {details from any per-repo smoke tests that were run}
+      
+      ### Overall: PASS/FAIL
+      
+      **Shadow ID:** {id}
+      ```
+    output: "shadow_results"
+    timeout: 1200
+
+  - id: "post-shadow-verify"
+    type: "bash"
+    condition: "{{skip_shadow_tests}} != true"
+    command: |
+      set -e
+      
+      CURRENT=$(amplifier --version 2>&1 || echo "NOT_INSTALLED")
+      BASELINE="{{baseline.host_version}}"
+      
+      if [ "$CURRENT" != "$BASELINE" ]; then
+        echo "WARNING: Host amplifier changed during testing!" >&2
+        echo "{\"host_unchanged\": false, \"before\": \"$BASELINE\", \"after\": \"$CURRENT\"}"
+      else
+        echo "{\"host_unchanged\": true, \"version\": \"$CURRENT\"}"
+      fi
+    output: "host_verify"
+    parse_json: true
+    timeout: 30
+
+  # ============================================================================
+  # PHASE 7: FINAL REPORT
+  # ============================================================================
+
+  - id: "synthesize-report"
+    agent: "foundation:zen-architect"
+    mode: "ARCHITECT"
+    prompt: |
+      Create final multi-PR review report combining all analysis and test results.
+      
+      ## PRs Reviewed
+      {{all_pr_metadata}}
+      
+      ## Mount Plan
+      {{mount_plan}}
+      
+      ## Analysis Results
+      - Cross-repo analysis: {{cross_repo_analysis}}
+      - Code reviews: {{code_reviews}}
+      
+      ## Testing Results
+      - Shadow environment tests: {{shadow_results}}
+      - Host verification: {{host_verify}}
+      
+      ## Report Format
+      
+      Create a comprehensive GitHub-style report with:
+      
+      1. **Executive Summary**
+         - Overall verdict for the PR SET (all must pass for APPROVE)
+         - Key integration findings
+      
+      2. **Individual PR Summaries**
+         - Brief assessment of each PR
+         - Specific issues or praise
+      
+      3. **Integration Analysis**
+         - How the PRs work together
+         - Dependency relationships verified
+         - Any concerns about combined behavior
+      
+      4. **Test Results Summary**
+         - Shadow environment: PASS/FAIL
+         - Standard smoke tests: PASS/FAIL with details
+         - Per-repo smoke tests: PASS/FAIL/SKIPPED for each repo
+      
+      5. **Recommendations**
+         - Merge order (which PR first?)
+         - Any required changes before merging
+         - Post-merge verification steps
+    output: "report"
+    timeout: 600
+
+  - id: "save-report"
+    type: "bash"
+    command: |
+      set -e
+      WORKSPACE=$(echo "{{paths.workspace}}" | tr -d '\n\r')
+      
+      # Generate a combined PR identifier
+      PR_IDS=$(echo '{{all_pr_metadata}}' | jq -r '.[].pr_number' | tr '\n' '-' | sed 's/-$//')
+      
+      cat > "${WORKSPACE}/multi-pr-${PR_IDS}-review.md" << 'EOF'
+      {{report}}
+      EOF
+      
+      realpath "${WORKSPACE}/multi-pr-${PR_IDS}-review.md"
+    output: "final_output"
+    timeout: 30
