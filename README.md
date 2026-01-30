@@ -2,13 +2,39 @@
 
 Comprehensive workflow for reviewing Pull Requests to Amplifier ecosystem repos, with support for single PRs and multi-PR interdependent changes.
 
-## Installation
+## Quick Start (Recommended Workflow)
+
+Create a fresh directory for each PR review to keep workspaces isolated:
 
 ```bash
-amplifier bundle add git+https://github.com/robotdad/amplifier-bundle-pr-review
+# 1. Create and enter a new directory for this review
+mkdir pr-review-65 && cd pr-review-65
+
+# 2. Add the bundle as a project dependency
+amplifier bundle add git+https://github.com/robotdad/amplifier-bundle-pr-review@main --project
+
+# 3. Start Amplifier
+amplifier
+
+# 4. Activate recipe-runner mode and run the review
+> /mode recipe-runner
+> Run the pr-review-full recipe for https://github.com/microsoft/amplifier-app-cli/pull/65
 ```
 
-## Quick Start
+For multi-PR reviews:
+
+```bash
+mkdir multi-pr-review && cd multi-pr-review
+amplifier bundle add git+https://github.com/robotdad/amplifier-bundle-pr-review@main --project
+amplifier
+
+> /mode recipe-runner
+> Run the pr-review-multi recipe for modes#3 and recipes#19
+```
+
+## Alternative: Direct CLI Invocation
+
+If you prefer not to use interactive mode:
 
 ### Single PR Review
 
@@ -19,9 +45,7 @@ amplifier tool invoke recipes \
   context='{"pr_url": "https://github.com/microsoft/amplifier-app-cli/pull/65"}'
 ```
 
-### Multi-PR Review (Related PRs Together)
-
-When PRs across repos depend on each other (e.g., a bundle PR that requires changes in another bundle):
+### Multi-PR Review
 
 ```bash
 amplifier tool invoke recipes \
@@ -33,12 +57,6 @@ amplifier tool invoke recipes \
       "https://github.com/microsoft/amplifier-bundle-recipes/pull/19"
     ]
   }'
-```
-
-Or from within an Amplifier session:
-
-```
-> Run the pr-review-multi recipe with these PRs: modes#3 and recipes#19
 ```
 
 ## Available Recipes
