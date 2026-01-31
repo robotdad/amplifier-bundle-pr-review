@@ -1,9 +1,12 @@
 name: "pr-review-full"
-description: "Complete PR review workflow for amplifier-app-cli"
-version: "2.6.0"
+description: "Review a SINGLE PR with code analysis and shadow testing. For multiple PRs, use pr-review-multi.yaml instead."
+version: "2.7.0"
 author: "Amplifier PR Review Bundle"
-tags: ["pr-review", "amplifier", "testing"]
+tags: ["pr-review", "amplifier", "testing", "single-pr"]
 
+# NOTE: This recipe is for ONE PR only. 
+# For reviewing multiple related PRs together, use pr-review-multi.yaml
+#
 # Usage:
 #   amplifier tool invoke recipes operation=execute \
 #     recipe_path=@pr-review:recipes/pr-review-full.yaml \
@@ -11,7 +14,8 @@ tags: ["pr-review", "amplifier", "testing"]
 
 context:
   pr_url: ""
-  workspace_base: "./pr-review"
+  # Workspace includes PR number to avoid conflicts if run in parallel
+  workspace_base: ""  # Will be set dynamically based on PR number
   skip_shadow_tests: false
   skip_llm_smoke: false
 
@@ -20,17 +24,6 @@ steps:
   # PHASE 1: SETUP AND FETCH PR INFO
   # ============================================================================
   
-  - id: "init-workspace"
-    type: "bash"
-    command: |
-      set -e
-      mkdir -p "{{workspace_base}}"
-      cd "{{workspace_base}}"
-      echo "{\"workspace\": \"$(pwd)\"}"
-    output: "paths"
-    parse_json: true
-    timeout: 30
-
   - id: "parse-pr-url"
     type: "bash"
     command: |
@@ -67,6 +60,19 @@ steps:
         --name-only | sort -u | head -100
     output: "changed_files"
     timeout: 60
+
+  - id: "init-workspace"
+    type: "bash"
+    command: |
+      set -e
+      # Use PR-specific workspace to avoid conflicts with parallel runs
+      WORKSPACE="./pr-review-{{pr_info.pr_number}}"
+      mkdir -p "$WORKSPACE"
+      cd "$WORKSPACE"
+      echo "{\"workspace\": \"$(pwd)\"}"
+    output: "paths"
+    parse_json: true
+    timeout: 30
 
   # ============================================================================
   # PHASE 2: CLONE REPOS

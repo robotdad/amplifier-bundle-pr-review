@@ -1,16 +1,23 @@
 name: "pr-review-multi"
-description: "Review multiple related PRs together with integrated shadow testing"
-version: "1.0.0"
+description: "Review MULTIPLE related PRs AS A UNIFIED CHANGE SET. Use this when PRs depend on each other or should be tested together."
+version: "1.1.0"
 author: "Amplifier PR Review Bundle"
-tags: ["pr-review", "amplifier", "multi-repo", "testing"]
+tags: ["pr-review", "amplifier", "multi-repo", "multi-pr", "testing"]
 
+# USE THIS RECIPE when:
+# - You have 2+ PRs that depend on each other
+# - PRs are in different repos but work together  
+# - You want to test combined behavior before merging
+#
+# For a single PR, use pr-review-full.yaml instead.
+#
 # Usage:
 #   amplifier tool invoke recipes operation=execute \
 #     recipe_path=@pr-review:recipes/pr-review-multi.yaml \
 #     context='{
 #       "pr_urls": [
-#         "https://github.com/microsoft/amplifier-bundle-recipes/pull/19",
-#         "https://github.com/microsoft/amplifier-bundle-modes/pull/3"
+#         "https://github.com/microsoft/amplifier-bundle-modes/pull/3",
+#         "https://github.com/microsoft/amplifier-bundle-recipes/pull/19"
 #       ]
 #     }'
 
@@ -260,71 +267,81 @@ steps:
   - id: "cross-repo-analysis"
     agent: "foundation:explorer"
     prompt: |
-      Analyze cross-repo interactions between all PRs.
+      ## Analyze These PRs as a UNIFIED CHANGE SET
       
-      ## PRs Being Analyzed
+      These PRs are intended to be merged together. Your job is to verify they
+      integrate correctly and identify any gaps or conflicts.
+      
+      ## PRs (treat as one logical change)
       {{all_pr_metadata}}
       
       ## Clone Paths
       {{clone_paths}}
       
-      ## Mount Plan
+      ## Mount Plan (shows dependencies)
       {{mount_plan}}
       
-      ## Tasks
+      ## Analysis Tasks
       
-      1. For each PR, examine the changed files
-      2. Check if any changes affect interfaces/APIs that other PRs depend on
-      3. Look for:
-         - Shared module dependencies
+      1. **Verify the dependency chain**: Does mount_plan.dependency_order make sense?
+      2. **Check integration points**: Where do these PRs connect?
+         - Shared imports/exports
          - Event names that must match
          - Configuration keys that must align
-         - Import paths that must be consistent
-      
-      4. Identify any potential integration issues where:
-         - One PR assumes behavior the other PR changes
-         - Version requirements conflict
-         - Module loading order matters
+      3. **Find gaps**: Is anything missing for these to work together?
+      4. **Check for conflicts**: Do any changes contradict each other?
       
       ## Output Format
       
       ```
-      ## Cross-PR Analysis
+      ## Cross-PR Integration Analysis
       
-      ### Dependency Graph
-      [which PR depends on which]
+      ### How These PRs Connect
+      [describe the integration points]
       
-      ### Integration Points
-      [specific interfaces/APIs that connect the PRs]
+      ### Dependency Order
+      [confirm or correct mount_plan.dependency_order]
       
-      ### Potential Issues
-      [any conflicts or concerns]
+      ### Integration Gaps (if any)
+      [anything missing for these to work together]
       
       ### VERDICT: COMPATIBLE / WARNING / CONFLICT
-      [summary assessment]
       ```
     output: "cross_repo_analysis"
     timeout: 300
 
-  - id: "individual-reviews"
+  - id: "unified-code-review"
     agent: "foundation:zen-architect"
     mode: "REVIEW"
     prompt: |
-      Review all PRs for code quality and architecture.
+      ## Review These PRs AS A UNIFIED CHANGE SET
       
-      ## PRs
+      These PRs are intended to work together. Review them as an integrated whole,
+      not as separate changes.
+      
+      ## PRs (treat as one logical change)
       {{all_pr_metadata}}
       
       ## Clone Paths  
       {{clone_paths}}
       
-      For each PR, assess:
-      - Architecture and design patterns
+      ## Review Focus
+      
+      1. **Combined Design**: How do these changes work together as a system?
+      2. **Interface Alignment**: Do the PRs define compatible contracts?
+      3. **Shared Patterns**: Are naming, structure, and patterns consistent across PRs?
+      4. **Gap Analysis**: Is anything missing that would be needed for these to work together?
+      
+      For each PR individually, also note:
       - Code quality and readability
       - Amplifier ecosystem alignment
-      - Potential issues
+      - Any issues specific to that PR
       
-      Provide a combined review with sections for each PR.
+      ## Output Structure
+      
+      1. **Unified Assessment** - How well do these PRs work together?
+      2. **Per-PR Notes** - Specific feedback for each PR
+      3. **Integration Recommendations** - Any changes needed for seamless integration
     output: "code_reviews"
     timeout: 600
 
@@ -374,157 +391,48 @@ steps:
     condition: "{{skip_shadow_tests}} != true"
     agent: "shadow-operator"
     prompt: |
-      ## MULTI-PR SHADOW ENVIRONMENT TEST
+      ## Test Multiple PRs Together in Shadow Environment
       
-      Test multiple related PRs together in an isolated container.
+      **IMPORTANT: Use ONLY the shadow tool. Do NOT use bash with docker commands.**
       
-      ---
+      ### Input Data
       
-      ## MOUNT PLAN
+      Mount plan: {{mount_plan}}
+      Baseline commits: {{baseline}}
+      PR metadata: {{all_pr_metadata}}
+      Skip LLM smoke tests: {{skip_llm_smoke}}
       
-      {{mount_plan}}
+      ### Instructions
       
-      ## BASELINE (verified commits)
+      1. **Create shadow** with `local_sources` built from mount_plan.sources:
+         - Format each as: `"{local_path}:{full_repo}"`
+         - Example: `shadow(operation="create", name="multi-pr", local_sources=["/path/to/repo:microsoft/amplifier-bundle-modes", ...])`
       
-      {{baseline}}
+      2. **Verify snapshot_commits** in create response match baseline.repos commits
       
-      ## PR METADATA
+      3. **Install CLI**: `shadow(operation="exec", command="uv tool install git+https://github.com/microsoft/amplifier-app-cli && amplifier provider install -q")`
       
-      {{all_pr_metadata}}
+      4. **Add bundles** in mount_plan.dependency_order:
+         - `shadow(operation="exec", command="amplifier bundle add git+https://github.com/{full_repo}@main")`
+         - Git URL rewrites automatically redirect to local Gitea
       
-      ---
+      5. **Run smoke tests**: `shadow(operation="exec", command="amplifier tool invoke recipes operation=execute recipe_path=@smoke-test:recipes/smoke-test.yaml context='{\"skip_llm\": ...}'")`
       
-      ## STRATEGY: USE local_sources FOR BUNDLES
+      6. **Cleanup**: `shadow(operation="destroy", ...)`
       
-      Unlike CLI testing (which requires inject due to UV caching), bundle testing
-      CAN use `local_sources` because `amplifier bundle add` uses git clone, which
-      respects the URL rewrites.
-      
-      ### Step 1: Build local_sources Array
-      
-      From the mount plan, construct the local_sources parameter:
-      ```
-      local_sources = [
-        "{path}:{owner}/{repo}",
-        ...
-      ]
-      ```
-      
-      For each source in mount_plan.sources, add:
-      `"{local_path}:{repo}"` where repo is the full_repo (owner/repo-name)
-      
-      ### Step 2: Create Shadow with All Sources
-      
-      ```
-      shadow(operation="create", name="multi-pr-test", local_sources=[...all sources...])
-      ```
-      
-      This sets up git URL rewrites for ALL repos simultaneously.
-      
-      ### Step 3: Verify Snapshots
-      
-      Check the returned `snapshot_commits` matches our baseline:
-      - Each repo in baseline.repos should have matching commit in snapshot_commits
-      
-      ### Step 4: Install Base Amplifier CLI
-      
-      ```
-      shadow(operation="exec", command="uv tool install git+https://github.com/microsoft/amplifier-app-cli")
-      shadow(operation="exec", command="amplifier provider install -q")
-      ```
-      
-      ### Step 5: Add Bundles in Dependency Order
-      
-      Follow mount_plan.dependency_order. For each bundle:
-      
-      ```
-      shadow(operation="exec", command="amplifier bundle add git+https://github.com/{full_repo}")
-      ```
-      
-      The git URL rewriting will redirect to local Gitea with our PR code!
-      
-      ### Step 6: Verify Bundle Installation
-      
-      ```
-      shadow(operation="exec", command="amplifier bundle list")
-      ```
-      
-      Each bundle should appear in the list.
-      
-      ### Step 7: Verify Local Code Is Used
-      
-      For each bundle repo, check the cached bundle location contains our commit:
-      ```
-      shadow(operation="exec", command="ls ~/.amplifier/cache/ | grep {repo-name}")
-      shadow(operation="exec", command="cd ~/.amplifier/cache/amplifier-bundle-{name}-* && git rev-parse --short HEAD")
-      ```
-      
-      Must match baseline.repos[repo].short
-      
-      ### Step 8: Install Smoke Test Bundle
-      
-      ```
-      shadow(operation="exec", command="amplifier bundle add git+https://github.com/samueljklee/amplifier-bundle-smoke-test --app")
-      ```
-      
-      ### Step 9: Run Smoke Tests
-      
-      ```
-      shadow(operation="exec", command="amplifier tool invoke recipes operation=execute recipe_path=@smoke-test:recipes/smoke-test.yaml context='{\"skip_llm\": {{skip_llm_smoke}}}'")
-      ```
-      
-      ### Step 10: Run Per-Repo Smoke Tests (if defined)
-      
-      For each repo in mount_plan.sources, check if it defines its own smoke tests:
-      ```
-      shadow(operation="exec", command="ls /workspace/{full_repo}/smoke-tests/ 2>/dev/null || echo 'no smoke-tests'")
-      ```
-      
-      If a `smoke-tests/smoke-test.yaml` exists, run it:
-      ```
-      shadow(operation="exec", command="amplifier tool invoke recipes operation=execute recipe_path=/workspace/{full_repo}/smoke-tests/smoke-test.yaml")
-      ```
-      
-      Collect results from all per-repo smoke tests.
-      
-      ### Step 11: Cleanup
-      
-      Destroy shadow (or preserve if failed for debugging).
-      
-      ---
-      
-      ## REQUIRED OUTPUT FORMAT
+      ### Output Format
       
       ```markdown
       ## Multi-PR Shadow Test Results
       
-      ### PRs Tested
       | Repo | PR | Commit | Status |
       |------|-----|--------|--------|
       | {repo} | #{number} | {short} | PASS/FAIL |
       
-      ### Source Verification
-      | Repo | Expected | Snapshot | Installed | Status |
-      |------|----------|----------|-----------|--------|
-      | ... | ... | ... | ... | PASS/FAIL |
-      
-      ### Bundle Installation
-      - {bundle-1}: PASS/FAIL
-      - {bundle-2}: PASS/FAIL
-      
-      ### Smoke Test Results
-      {output from standard smoke tests}
-      
-      ### Per-Repo Smoke Tests
-      | Repo | Has Tests | Result |
-      |------|-----------|--------|
-      | {repo} | yes/no | PASS/FAIL/SKIPPED |
-      
-      {details from any per-repo smoke tests that were run}
+      ### Smoke Tests
+      {summary of smoke test results}
       
       ### Overall: PASS/FAIL
-      
-      **Shadow ID:** {id}
       ```
     output: "shadow_results"
     timeout: 1200
